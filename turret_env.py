@@ -23,7 +23,7 @@ class TurretEnv:
 
         # Scaling constants for normalization
         self.max_distance = float(np.sqrt(WIDTH * WIDTH + HEIGHT * HEIGHT))
-        self.speed_scale = 3000.0  # mm/s, rough scale for projectile speed
+        self.speed_scale = 23000.0  # mm/s, rough scale for projectile speed
 
         self.sim: Simulator | None = None
         self.steps = 0
@@ -134,7 +134,7 @@ class TurretEnv:
         # Hit reward: positive reward when new hits occur
         hit_inc = self.sim.hit_count - self.prev_hit_count
         self.prev_hit_count = self.sim.hit_count
-        r_hit = 10.0 * hit_inc
+        r_hit = 100.0 * hit_inc
 
         # Shot penalty: small negative reward for each projectile fired
         shots_inc = self.sim.shots_fired - self.prev_shots_fired
@@ -158,7 +158,7 @@ class TurretEnv:
             angle_scale = np.deg2rad(45.0)  # beyond this, align bonus ~0
             align_score = max(0.0, 1.0 - angle_err / max(angle_scale, 1e-6))
             # Up to +2.0 for perfect alignment, minus a small penalty with distance
-            r_align = 16.0 * align_score - 2.0 * angle_err
+            r_align = 5.0 * align_score - 10.0 * angle_err
 
         # Tracking reward: strongly encourage keeping the target panel in view.
         # If the chosen target panel is visible, reward staying locked on it.
