@@ -75,7 +75,8 @@ def collect_episode(env: TurretEnv, policy: PolicyGRU, device, max_steps=500):
 
         action, log_prob, hidden = policy.sample_action(obs, hidden)
 
-        action_np = action.squeeze(0).squeeze(0).cpu().numpy()
+        # `action` tracks gradients for policy optimization; env stepping should not.
+        action_np = action.squeeze(0).squeeze(0).detach().cpu().numpy()
 
         obs_next, reward, done, _ = env.step(action_np)
 
@@ -139,7 +140,7 @@ def evaluate_policy(env, policy, device, episodes=10, max_steps=500):
             with torch.no_grad():
                 action, hidden = policy.mean_action(obs, hidden)
 
-            action_np = action.squeeze(0).squeeze(0).cpu().numpy()
+            action_np = action.squeeze(0).squeeze(0).detach().cpu().numpy()
 
             obs, reward, done, _ = env.step(action_np)
 
@@ -161,7 +162,9 @@ def evaluate_policy(env, policy, device, episodes=10, max_steps=500):
 
 def train():
 
-    env = TurretEnv()
+    # Each step, the simulator computes a non-ML baseline aim (yaw/pitch-to-panel),
+    # and the policy outputs a correction on top of it.
+    env = TurretEnv(action_is_correction=True, correction_baseline="panel")
 
     obs_dim = 7
     action_dim = 3

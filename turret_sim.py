@@ -184,6 +184,9 @@ class Simulator:
         self.robot = Robot(radius, self.camera)
         self.projectiles = []
         self.projectile_speed = 23000.0  # mm/s
+        # Latest applied camera increments (after rate limiting).
+        self.last_d_theta = 0.0
+        self.last_d_pitch = 0.0
 
         # Scoring / metrics
         self.total_time = 0.0
@@ -277,8 +280,14 @@ class Simulator:
     def step(self, dt, d_theta=0.0, d_pitch=0.0):
         # Camera control is now owned by the agent (RL policy).
         # d_theta, d_pitch are incremental changes per step.
+        d_theta = float(d_theta)
+        d_pitch = float(d_pitch)
+        self.last_d_theta = d_theta
+        self.last_d_pitch = d_pitch
         self.camera.theta += d_theta
         self.camera.pitch += d_pitch
+        # Keep yaw bounded to avoid wrap discontinuities in downstream code.
+        self.camera.theta = np.arctan2(np.sin(self.camera.theta), np.cos(self.camera.theta))
 
         # Optional: clamp pitch to a reasonable range (e.g., ±90 degrees)
         max_pitch = np.deg2rad(89)
@@ -366,7 +375,7 @@ class Simulator:
         - camera_pitch
         - yaw_to_panel        (global yaw from camera to panel)
         - pitch_to_panel      (global pitch from camera to panel)
-        - panel_yaw_rel       (panel outward normal yaw relative to camera yaw)
+        - panel_yaw_world     (panel outward normal yaw in world frame)
         - distance_to_panel   (3D distance, mm)
         - projectile_speed    (mm/s)
         """
@@ -391,10 +400,6 @@ class Simulator:
         # Recompute panel orientation the same way as in update_panels.
         theta_panel = self.robot.theta + target.base_theta
         panel_yaw_world = theta_panel
-        panel_yaw_rel = np.arctan2(
-            np.sin(panel_yaw_world - self.camera.theta),
-            np.cos(panel_yaw_world - self.camera.theta),
-        )
 
         features = np.array(
             [
@@ -402,7 +407,7 @@ class Simulator:
                 self.camera.pitch,
                 yaw_to_panel,
                 pitch_to_panel,
-                panel_yaw_rel,
+                panel_yaw_world,
                 distance,
                 self.projectile_speed,
             ],

@@ -10,7 +10,8 @@ def test_policy(model_path="best_policy_gru.pt", n_episodes=10, render=True):
     hidden_dim = 128
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    env = TurretEnv()
+    # Must match the action semantics used during training.
+    env = TurretEnv(action_is_correction=True, correction_baseline="panel")
     policy = PolicyGRU(obs_dim, hidden_dim, action_dim).to(device)
     policy.load_state_dict(torch.load(model_path, map_location=device))
     policy.eval()
