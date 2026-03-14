@@ -27,11 +27,8 @@ def test_policy(model_path="best_policy_gru.pt", n_episodes=10, render=True):
 
         while not done:
             with torch.no_grad():
-                action, _, hidden = policy.sample_action(obs, hidden)
+                action, hidden = policy.mean_action(obs, hidden)
             action_np = action.squeeze(0).squeeze(0).cpu().numpy()
-            action_np[0] = np.clip(action_np[0], -np.pi, np.pi)
-            action_np[1] = np.clip(action_np[1], -np.pi/3, np.pi/3)
-            action_np[2] = np.clip(action_np[2], 0, 1.0)
             obs_next, reward, done, info = env.step(action_np)
             ep_return += reward
             step += 1

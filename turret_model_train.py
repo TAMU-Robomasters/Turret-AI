@@ -13,6 +13,24 @@ class PolicyGRU(nn.Module):
         self.mu = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
 
+    @staticmethod
+    def _action_low(device):
+        return torch.tensor([-np.pi, -np.pi / 3.0, 0.0], dtype=torch.float32, device=device)
+
+    @staticmethod
+    def _action_high(device):
+        return torch.tensor([np.pi, np.pi / 3.0, 1.0], dtype=torch.float32, device=device)
+
+    def _squash_to_action_space(self, raw_action):
+        """
+        Map unconstrained actions to simulator ranges with tanh instead of
+        post-hoc clipping. This keeps training/inference behavior aligned.
+        """
+        low = self._action_low(raw_action.device)
+        high = self._action_high(raw_action.device)
+        action01 = 0.5 * (torch.tanh(raw_action) + 1.0)
+        return low + (high - low) * action01
+
     def forward(self, obs_seq, hidden=None):
         x = torch.relu(self.obs_embed(obs_seq))
         out, h = self.gru(x, hidden)
@@ -22,9 +40,21 @@ class PolicyGRU(nn.Module):
     def sample_action(self, obs_seq, hidden=None):
         mu, std, h = self.forward(obs_seq, hidden)
         dist = torch.distributions.Normal(mu, std)
-        action = dist.sample()
-        log_prob = dist.log_prob(action).sum(-1)
+        raw_action = dist.rsample()
+        action = self._squash_to_action_space(raw_action)
+
+        # Tanh squashing correction for log-probability.
+        # log(1 - tanh(x)^2) is numerically stable with this formulation.
+        log_det_jacobian = 2.0 * (
+            np.log(2.0) - raw_action - torch.nn.functional.softplus(-2.0 * raw_action)
+        )
+        log_prob = dist.log_prob(raw_action).sum(-1) - log_det_jacobian.sum(-1)
         return action, log_prob, h
+
+    def mean_action(self, obs_seq, hidden=None):
+        """Deterministic action used during evaluation."""
+        mu, _, h = self.forward(obs_seq, hidden)
+        return self._squash_to_action_space(mu), h
 
 
 def collect_episode(env: TurretEnv, policy: PolicyGRU, device, max_steps=500):
@@ -45,11 +75,7 @@ def collect_episode(env: TurretEnv, policy: PolicyGRU, device, max_steps=500):
 
         action, log_prob, hidden = policy.sample_action(obs, hidden)
 
-        action_np = action.squeeze(0).squeeze(0).cpu().numpy()
-
-        action_np[0] = np.clip(action_np[0], -np.pi, np.pi)
-        action_np[1] = np.clip(action_np[1], -np.pi/3, np.pi/3)
-        action_np[2] = np.clip(action_np[2], 0, 1.0)
+        action_np = action.squeeze(0).squeeze(0).detach().cpu().numpy()
 
         obs_next, reward, done, _ = env.step(action_np)
 
@@ -111,14 +137,9 @@ def evaluate_policy(env, policy, device, episodes=10, max_steps=500):
         for _ in range(max_steps):
 
             with torch.no_grad():
-                mu, _, hidden = policy(obs, hidden)
-                action = mu
+                action, hidden = policy.mean_action(obs, hidden)
 
-            action_np = action.squeeze(0).squeeze(0).cpu().numpy()
-
-            action_np[0] = np.clip(action_np[0], -np.pi, np.pi)
-            action_np[1] = np.clip(action_np[1], -np.pi/3, np.pi/3)
-            action_np[2] = np.clip(action_np[2], 0, 1.0)
+            action_np = action.squeeze(0).squeeze(0).detach().cpu().numpy()
 
             obs, reward, done, _ = env.step(action_np)
 
