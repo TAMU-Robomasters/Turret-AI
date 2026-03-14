@@ -75,7 +75,7 @@ def collect_episode(env: TurretEnv, policy: PolicyGRU, device, max_steps=500):
 
         action, log_prob, hidden = policy.sample_action(obs, hidden)
 
-        action_np = action.squeeze(0).squeeze(0).detach().cpu().numpy()
+        action_np = action.squeeze(0).squeeze(0).cpu().numpy()
 
         obs_next, reward, done, _ = env.step(action_np)
 
@@ -139,7 +139,7 @@ def evaluate_policy(env, policy, device, episodes=10, max_steps=500):
             with torch.no_grad():
                 action, hidden = policy.mean_action(obs, hidden)
 
-            action_np = action.squeeze(0).squeeze(0).detach().cpu().numpy()
+            action_np = action.squeeze(0).squeeze(0).cpu().numpy()
 
             obs, reward, done, _ = env.step(action_np)
 
