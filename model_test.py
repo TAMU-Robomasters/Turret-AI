@@ -12,7 +12,15 @@ def test_policy(model_path="best_policy_gru.pt", n_episodes=10, render=True):
 
     # Must match the action semantics used during training.
     env = TurretEnv(action_is_correction=True, correction_baseline="panel")
-    policy = PolicyGRU(obs_dim, hidden_dim, action_dim).to(device)
+    correction_yaw_max = float(getattr(env, "correction_clip_yaw", np.deg2rad(30.0)) or np.deg2rad(30.0))
+    correction_pitch_max = float(getattr(env, "correction_clip_pitch", np.deg2rad(15.0)) or np.deg2rad(15.0))
+    policy = PolicyGRU(
+        obs_dim,
+        hidden_dim,
+        action_dim,
+        action_low=[-correction_yaw_max, -correction_pitch_max, 0.0],
+        action_high=[correction_yaw_max, correction_pitch_max, 1.0],
+    ).to(device)
     policy.load_state_dict(torch.load(model_path, map_location=device))
     policy.eval()
 

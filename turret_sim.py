@@ -9,8 +9,8 @@ import time
 # - Accelerations are in mm/s^2
 # - Time is in seconds
 
-WIDTH = 6000          # mm
-HEIGHT = 6000         # mm
+WIDTH = 15000          # mm
+HEIGHT = 15000         # mm
 DEBUG = True
 
 GRAVITY = -9800.0     # mm/s^2, downward acceleration
@@ -145,7 +145,7 @@ class Robot:
                 self.vy -= v_radial * np.sin(angle)
 
 class Projectile:
-    def __init__(self, x, y, z, theta, pitch, speed):
+    def __init__(self, x, y, z, theta, pitch, speed, allowed_panel_indices=()):
         self.x = x
         self.y = y
         self.z = z
@@ -155,6 +155,9 @@ class Projectile:
         self.vy = horiz_speed * np.sin(theta)
         self.vz = speed * np.sin(pitch)
         self.alive = True
+        # Panels that were visible (in-FOV and facing camera) when this shot was fired.
+        # Hits on panels not in this set are ignored to match "must be seen to shoot".
+        self.allowed_panel_indices = tuple(int(i) for i in allowed_panel_indices)
 
     def update(self, dt):
         if not self.alive:
@@ -194,6 +197,8 @@ class Simulator:
         self.ideal_alignment_time = 0.0  # time camera is near ideal lead angle
         self.hit_count = 0
         self.shots_fired = 0  # total number of projectiles spawned
+        self.last_shot_visible_panel_indices = ()
+        self.last_shot_visible_panel_count = 0
 
         # For estimating relative velocity of the robot center (camera-centered)
         self._prev_rel_center = None
@@ -210,6 +215,53 @@ class Simulator:
         # Random offset so robot is somewhere within the cone, not dead center
         yaw_offset = random.uniform(-self.camera.fov / 4, self.camera.fov / 4)
         self.camera.theta = base_yaw + yaw_offset
+
+    @staticmethod
+    def _ballistic_pitch_for_point(horiz_dist: float, z: float, speed: float, gravity: float):
+        """
+        Solve for a launch pitch angle (radians) to hit a point at (R, z)
+        with initial speed `speed` under constant vertical acceleration `gravity`.
+
+        Conventions:
+          - gravity should be negative (e.g., -9800 mm/s^2).
+          - Positive pitch shoots upward.
+
+        Returns:
+          - pitch (float) if a real solution exists, else None.
+        """
+        R = float(horiz_dist)
+        if R <= 1e-6 or speed <= 1e-6:
+            return None
+        g = float(gravity)
+        if g >= 0.0:
+            return None
+
+        g_abs = -g
+        v2 = speed * speed
+
+        # From projectile motion: z = R*tan(a) - (g_abs * R^2)/(2*v^2*cos^2(a))
+        # Solve quadratic in tan(a):
+        # tan(a) = (v^2 ± sqrt(v^4 - g_abs*(g_abs*R^2 + 2*z*v^2))) / (g_abs*R)
+        disc = v2 * v2 - g_abs * (g_abs * R * R + 2.0 * z * v2)
+        if disc < 0.0:
+            return None
+
+        sqrt_disc = float(np.sqrt(disc))
+        denom = g_abs * R
+        if denom <= 1e-12:
+            return None
+
+        tan1 = (v2 + sqrt_disc) / denom
+        tan2 = (v2 - sqrt_disc) / denom
+        cand = [float(np.arctan(tan1)), float(np.arctan(tan2))]
+
+        max_pitch = float(np.deg2rad(89))
+        cand = [a for a in cand if np.isfinite(a) and -max_pitch <= a <= max_pitch]
+        if not cand:
+            return None
+
+        # Prefer the smaller-magnitude pitch (typically the lower/straighter arc).
+        return min(cand, key=lambda a: abs(a))
 
     def _get_target_panel(self):
         """
@@ -239,6 +291,9 @@ class Simulator:
         return closest_visible if closest_visible is not None else closest_any
 
     def fire_projectile(self):
+        visible_indices = tuple(i for i, p in enumerate(self.robot.panels) if p.visible)
+        self.last_shot_visible_panel_indices = visible_indices
+        self.last_shot_visible_panel_count = len(visible_indices)
         # Spawn a projectile from the camera along its current heading
         proj = Projectile(
             self.camera.x,
@@ -247,6 +302,7 @@ class Simulator:
             self.camera.theta,
             self.camera.pitch,
             self.projectile_speed,
+            allowed_panel_indices=visible_indices,
         )
         self.projectiles.append(proj)
         self.shots_fired += 1
@@ -259,7 +315,9 @@ class Simulator:
                 continue
 
             hit = False
-            for panel in self.robot.panels:
+            for idx, panel in enumerate(self.robot.panels):
+                if proj.allowed_panel_indices and idx not in proj.allowed_panel_indices:
+                    continue
                 # 3D positional tolerance check (sphere of radius hit_tol_mm)
                 dx = proj.x - panel.x
                 dy = proj.y - panel.y
@@ -325,7 +383,7 @@ class Simulator:
             self.opportunity_time += dt
 
         # Ideal lead direction toward future robot center based on simple intercept
-        # approximation (ignores gravity for this alignment metric).
+        # approximation (gravity is included in ideal pitch).
         p = np.array([rel_x, rel_y, rel_z], dtype=float)
         v = np.array([vx, vy, vz], dtype=float)
         p_norm = np.linalg.norm(p)
@@ -343,7 +401,15 @@ class Simulator:
             fx, fy, fz = future_pos
             horiz_dist = np.hypot(fx, fy)
             ideal_yaw = np.arctan2(fy, fx)
-            ideal_pitch = np.arctan2(fz, horiz_dist)
+            ideal_pitch = self._ballistic_pitch_for_point(
+                horiz_dist=horiz_dist,
+                z=fz,
+                speed=self.projectile_speed,
+                gravity=GRAVITY,
+            )
+            if ideal_pitch is None:
+                # Fall back to straight-line pitch if no ballistic solution exists.
+                ideal_pitch = np.arctan2(fz, horiz_dist)
 
             # Store for debug drawing
             self.ideal_yaw = ideal_yaw
@@ -399,7 +465,7 @@ class Simulator:
         # Panel outward normal yaw (world), then relative to camera yaw
         # Recompute panel orientation the same way as in update_panels.
         theta_panel = self.robot.theta + target.base_theta
-        panel_yaw_world = theta_panel
+        panel_yaw_world = np.arctan2(np.sin(theta_panel), np.cos(theta_panel))
 
         features = np.array(
             [
@@ -422,7 +488,7 @@ class Simulator:
         The model outputs:
         - target_yaw: desired camera yaw (rad, world frame)
         - target_pitch: desired camera pitch (rad)
-        - time_to_fire: predicted time until firing (s, relative to *now*)
+        - time_to_fire: predicted time until firing (seconds, relative to *now*; not a probability)
 
         This helper:
         - Converts (target_yaw, target_pitch) into incremental deltas

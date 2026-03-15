@@ -24,6 +24,8 @@ class TurretEnv:
         action_is_delta: bool = False,
         action_is_correction: bool = False,
         correction_baseline: str = "panel",
+        correction_clip_yaw: float | None = float(np.deg2rad(30.0)),
+        correction_clip_pitch: float | None = float(np.deg2rad(15.0)),
         maintain_fire_timer: bool = True,
         lost_done_steps: int = 150,
         lost_penalty_base: float = -200.0,
@@ -36,6 +38,8 @@ class TurretEnv:
         self.action_is_delta = action_is_delta
         self.action_is_correction = action_is_correction
         self.correction_baseline = correction_baseline
+        self.correction_clip_yaw = None if correction_clip_yaw is None else float(correction_clip_yaw)
+        self.correction_clip_pitch = None if correction_clip_pitch is None else float(correction_clip_pitch)
         self.maintain_fire_timer = maintain_fire_timer
         self.lost_done_steps = int(lost_done_steps)
         self.lost_penalty_base = float(lost_penalty_base)
@@ -91,6 +95,7 @@ class TurretEnv:
                 - target_yaw = baseline_yaw + a0
                 - target_pitch = baseline_pitch + a1
           - time_to_fire_cmd: time until firing (seconds).
+              This is a continuous *time-to-fire in seconds* (not a probability).
               - If maintain_fire_timer=True (default): this value arms the
                 robot's internal countdown timer (if not already armed).
                 The timer then counts down by dt each step and fires when <= 0.
@@ -104,12 +109,20 @@ class TurretEnv:
         if action.shape[0] != 3:
             raise ValueError("Action must have shape (3,), got %s" % (action.shape,))
 
-        a0 = float(action[0])
-        a1 = float(action[1])
+        a0_raw = float(action[0])
+        a1_raw = float(action[1])
+        a0 = a0_raw
+        a1 = a1_raw
         if self.action_is_delta and self.action_is_correction:
             raise ValueError("Choose only one of action_is_delta or action_is_correction.")
 
+        baseline_yaw = None
+        baseline_pitch = None
         if self.action_is_correction:
+            if self.correction_clip_yaw is not None:
+                a0 = float(np.clip(a0, -self.correction_clip_yaw, self.correction_clip_yaw))
+            if self.correction_clip_pitch is not None:
+                a1 = float(np.clip(a1, -self.correction_clip_pitch, self.correction_clip_pitch))
             if self.correction_baseline == "panel":
                 raw = self.sim.get_model_input()
                 baseline_yaw = float(raw[2])
@@ -156,7 +169,21 @@ class TurretEnv:
             "total_time": self.sim.total_time,
             "opportunity_time": self.sim.opportunity_time,
             "ideal_alignment_time": self.sim.ideal_alignment_time,
+            "target_yaw": float(target_yaw),
+            "target_pitch": float(target_pitch),
+            "last_shot_visible_panel_count": int(getattr(self.sim, "last_shot_visible_panel_count", 0) or 0),
         }
+        if self.action_is_correction:
+            info.update(
+                {
+                    "baseline_yaw": float(baseline_yaw) if baseline_yaw is not None else None,
+                    "baseline_pitch": float(baseline_pitch) if baseline_pitch is not None else None,
+                    "correction_yaw_raw": float(a0_raw),
+                    "correction_pitch_raw": float(a1_raw),
+                    "correction_yaw_applied": float(a0),
+                    "correction_pitch_applied": float(a1),
+                }
+            )
 
         return obs, reward, done, info
 
@@ -220,6 +247,13 @@ class TurretEnv:
         self.prev_shots_fired = self.sim.shots_fired
         # Stronger penalty per shot to discourage spamming
         r_shot = -15.0 * shots_inc
+        r_blind_fire = 0.0
+        if shots_inc > 0:
+            visible_cnt = int(getattr(self.sim, "last_shot_visible_panel_count", 0) or 0)
+            if visible_cnt <= 0:
+                # In the real system you shouldn't be able to score hits on an unseen panel.
+                # Strongly discourage firing when no valid target is visible.
+                r_blind_fire = -500.0 * shots_inc
 
         # Alignment reward: encourage camera to track ideal lead angle
         r_align = 0.0
@@ -270,7 +304,7 @@ class TurretEnv:
         self._prev_d_theta = d_theta
         self._prev_d_pitch = d_pitch
 
-        return float(r_hit + r_shot + r_align + r_track + r_motion + r_jerk)
+        return float(r_hit + r_shot + r_blind_fire + r_align + r_track + r_motion + r_jerk)
 
     def _is_done(self) -> bool:
         """Episode termination condition."""

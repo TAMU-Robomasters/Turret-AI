@@ -6,20 +6,31 @@ from turret_env import TurretEnv
 
 
 class PolicyGRU(nn.Module):
-    def __init__(self, obs_dim: int, hidden_dim: int, action_dim: int):
+    def __init__(
+        self,
+        obs_dim: int,
+        hidden_dim: int,
+        action_dim: int,
+        action_low=None,
+        action_high=None,
+    ):
         super().__init__()
         self.obs_embed = nn.Linear(obs_dim, hidden_dim)
         self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
         self.mu = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
+        if action_low is None:
+            action_low = [-np.pi, -np.pi / 3.0, 0.0]
+        if action_high is None:
+            action_high = [np.pi, np.pi / 3.0, 1.0]
+        self._action_low_np = np.asarray(action_low, dtype=np.float32)
+        self._action_high_np = np.asarray(action_high, dtype=np.float32)
 
-    @staticmethod
-    def _action_low(device):
-        return torch.tensor([-np.pi, -np.pi / 3.0, 0.0], dtype=torch.float32, device=device)
+    def _action_low(self, device):
+        return torch.as_tensor(self._action_low_np, dtype=torch.float32, device=device)
 
-    @staticmethod
-    def _action_high(device):
-        return torch.tensor([np.pi, np.pi / 3.0, 1.0], dtype=torch.float32, device=device)
+    def _action_high(self, device):
+        return torch.as_tensor(self._action_high_np, dtype=torch.float32, device=device)
 
     def _squash_to_action_space(self, raw_action):
         """
@@ -172,7 +183,17 @@ def train():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    policy = PolicyGRU(obs_dim, hidden_dim, action_dim).to(device)
+    # In correction mode, actions are per-step corrections, not absolute yaw/pitch.
+    # Keep their range modest; large ranges let the policy "learn" ~pi (180°) flips.
+    correction_yaw_max = float(getattr(env, "correction_clip_yaw", np.deg2rad(30.0)) or np.deg2rad(30.0))
+    correction_pitch_max = float(getattr(env, "correction_clip_pitch", np.deg2rad(15.0)) or np.deg2rad(15.0))
+    policy = PolicyGRU(
+        obs_dim,
+        hidden_dim,
+        action_dim,
+        action_low=[-correction_yaw_max, -correction_pitch_max, 0.0],
+        action_high=[correction_yaw_max, correction_pitch_max, 1.0],
+    ).to(device)
 
     optimizer = optim.Adam(policy.parameters(), lr=1e-3)
 
