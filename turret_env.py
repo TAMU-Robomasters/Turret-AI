@@ -1,4 +1,5 @@
 import numpy as np
+import random
 
 from turret_sim import Simulator, WIDTH, HEIGHT
 
@@ -32,6 +33,7 @@ class TurretEnv:
         lost_penalty_slope: float = -20.0,
         lost_penalty_cap_steps: int = 50,
         lost_terminal_penalty: float = -5000.0,
+        seed: int | None = None,
     ):
         self.dt = dt
         self.max_steps = max_steps
@@ -46,6 +48,7 @@ class TurretEnv:
         self.lost_penalty_slope = float(lost_penalty_slope)
         self.lost_penalty_cap_steps = int(lost_penalty_cap_steps)
         self.lost_terminal_penalty = float(lost_terminal_penalty)
+        self.seed = None if seed is None else int(seed)
 
         # Scaling constants for normalization
         self.max_distance = float(np.sqrt(WIDTH * WIDTH + HEIGHT * HEIGHT))
@@ -63,8 +66,14 @@ class TurretEnv:
     # ------------------------------------------------------------------
     # Core API
     # ------------------------------------------------------------------
-    def reset(self) -> np.ndarray:
+    def reset(self, seed: int | None = None) -> np.ndarray:
         """Reset the simulation and return the initial observation."""
+        if seed is None:
+            seed = self.seed
+        if seed is not None:
+            # Simulator uses both Python's `random` and NumPy RNG.
+            random.seed(int(seed))
+            np.random.seed(int(seed))
         self.sim = Simulator()
         self.steps = 0
         self.prev_hit_count = 0
@@ -240,13 +249,13 @@ class TurretEnv:
         # Hit reward: positive reward when new hits occur
         hit_inc = self.sim.hit_count - self.prev_hit_count
         self.prev_hit_count = self.sim.hit_count
-        r_hit = 100.0 * hit_inc
+        r_hit = 110.0 * hit_inc
 
         # Shot penalty: small negative reward for each projectile fired
         shots_inc = self.sim.shots_fired - self.prev_shots_fired
         self.prev_shots_fired = self.sim.shots_fired
         # Stronger penalty per shot to discourage spamming
-        r_shot = -15.0 * shots_inc
+        r_shot = -30.0 * shots_inc
         r_blind_fire = 0.0
         if shots_inc > 0:
             visible_cnt = int(getattr(self.sim, "last_shot_visible_panel_count", 0) or 0)

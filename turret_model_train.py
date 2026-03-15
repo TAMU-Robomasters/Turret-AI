@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import argparse
 from turret_env import TurretEnv
 
 
@@ -51,7 +52,10 @@ class PolicyGRU(nn.Module):
     def sample_action(self, obs_seq, hidden=None):
         mu, std, h = self.forward(obs_seq, hidden)
         dist = torch.distributions.Normal(mu, std)
-        raw_action = dist.rsample()
+        # REINFORCE / score-function gradient: do not backprop through the sampled action.
+        # Using `rsample()` here would make `raw_action` a differentiable function of (mu, std)
+        # and biases/cancels the intended ∇θ log πθ(a) update.
+        raw_action = dist.sample()
         action = self._squash_to_action_space(raw_action)
 
         # Tanh squashing correction for log-probability.
@@ -68,14 +72,20 @@ class PolicyGRU(nn.Module):
         return self._squash_to_action_space(mu), h
 
 
-def collect_episode(env: TurretEnv, policy: PolicyGRU, device, max_steps=500):
+def collect_episode(
+    env: TurretEnv,
+    policy: PolicyGRU,
+    device,
+    max_steps: int = 500,
+    reset_seed: int | None = None,
+):
 
     obs_buf = []
     act_buf = []
     logprob_buf = []
     reward_buf = []
 
-    obs = env.reset()
+    obs = env.reset(seed=reset_seed)
     obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
     obs = obs.unsqueeze(0).unsqueeze(0)
 
@@ -97,7 +107,8 @@ def collect_episode(env: TurretEnv, policy: PolicyGRU, device, max_steps=500):
 
         obs_buf.append(obs.squeeze(0))
         act_buf.append(action.squeeze(0))
-        logprob_buf.append(log_prob.squeeze(0))
+        # Keep log-prob as a 1D tensor of length T so it aligns with returns.
+        logprob_buf.append(log_prob.squeeze())
         reward_buf.append(reward)
 
         obs = obs_next_t
@@ -108,7 +119,7 @@ def collect_episode(env: TurretEnv, policy: PolicyGRU, device, max_steps=500):
     traj = {
         "obs": torch.cat(obs_buf, dim=0),
         "act": torch.cat(act_buf, dim=0),
-        "logprob": torch.stack(logprob_buf, dim=0),
+        "logprob": torch.stack(logprob_buf, dim=0).view(-1),
         "reward": torch.as_tensor(reward_buf, dtype=torch.float32, device=device),
     }
 
@@ -127,7 +138,7 @@ def compute_returns(rewards, gamma=0.99):
     return torch.as_tensor(returns, dtype=torch.float32, device=rewards.device)
 
 
-def evaluate_policy(env, policy, device, episodes=10, max_steps=500):
+def evaluate_policy(env, policy, device, episodes=10, max_steps=500, base_seed: int | None = None):
     """
     Runs deterministic evaluation episodes and returns mean reward.
     """
@@ -138,7 +149,10 @@ def evaluate_policy(env, policy, device, episodes=10, max_steps=500):
 
     for _ in range(episodes):
 
-        obs = env.reset()
+        if base_seed is None:
+            obs = env.reset()
+        else:
+            obs = env.reset(seed=base_seed + len(returns))
         obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
         obs = obs.unsqueeze(0).unsqueeze(0)
 
@@ -171,11 +185,20 @@ def evaluate_policy(env, policy, device, episodes=10, max_steps=500):
     return np.mean(returns)
 
 
-def train():
+def train(
+    n_episodes: int = 100000,
+    eval_interval: int = 50,
+    eval_episodes: int = 25,
+    lr: float = 12e-4,
+    grad_clip_norm: float = 1.0,
+    seed: int | None = None,
+    eval_seed: int | None = 12345,
+    save_current_every: int = 10,
+):
 
     # Each step, the simulator computes a non-ML baseline aim (yaw/pitch-to-panel),
     # and the policy outputs a correction on top of it.
-    env = TurretEnv(action_is_correction=True, correction_baseline="panel")
+    env = TurretEnv(action_is_correction=True, correction_baseline="panel", seed=seed)
 
     obs_dim = 7
     action_dim = 3
@@ -195,34 +218,54 @@ def train():
         action_high=[correction_yaw_max, correction_pitch_max, 1.0],
     ).to(device)
 
-    optimizer = optim.Adam(policy.parameters(), lr=1e-3)
+    if seed is not None:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+    optimizer = optim.Adam(policy.parameters(), lr=float(lr))
 
     best_return = -np.inf
 
     best_model_path = "best_policy_gru.pt"
     current_model_path = "current_gru.pt"
 
-    n_episodes = 100000
-    eval_interval = 50
-    eval_episodes = 10
-
     for episode in range(1, n_episodes + 1):
 
-        traj = collect_episode(env, policy, device)
+        traj = collect_episode(
+            env,
+            policy,
+            device,
+            reset_seed=None if seed is None else int(seed + episode),
+        )
 
         returns = compute_returns(traj["reward"], gamma=0.99).detach()
 
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        # Robust normalization: avoid NaNs for very short episodes.
+        if returns.numel() > 1:
+            ret_std = returns.std(unbiased=False)
+        else:
+            ret_std = torch.tensor(1.0, device=returns.device, dtype=returns.dtype)
+        returns = (returns - returns.mean()) / (ret_std + 1e-8)
 
         log_probs = traj["logprob"]
+        if log_probs.numel() != returns.numel():
+            raise RuntimeError(
+                f"log_probs and returns must align; got log_probs={tuple(log_probs.shape)} returns={tuple(returns.shape)}"
+            )
 
-        loss = -(log_probs * returns).sum()
+        # Use mean loss so gradient scale doesn't grow with episode length.
+        loss = -(log_probs.view(-1) * returns.view(-1)).mean()
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite loss at episode {episode}: {loss.item()}")
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if grad_clip_norm is not None and grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=float(grad_clip_norm))
         optimizer.step()
 
-        torch.save(policy.state_dict(), current_model_path)
+        if save_current_every and (episode % int(save_current_every) == 0):
+            torch.save(policy.state_dict(), current_model_path)
 
         total_return = traj["reward"].sum().item()
 
@@ -234,7 +277,11 @@ def train():
         if episode % eval_interval == 0:
 
             eval_return = evaluate_policy(
-                env, policy, device, episodes=eval_episodes
+                env,
+                policy,
+                device,
+                episodes=eval_episodes,
+                base_seed=None if eval_seed is None else int(eval_seed),
             )
 
             print(
@@ -253,4 +300,24 @@ def train():
 
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--episodes", type=int, default=100000)
+    parser.add_argument("--eval-interval", type=int, default=50)
+    parser.add_argument("--eval-episodes", type=int, default=25)
+    parser.add_argument("--lr", type=float, default=12e-4)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--eval-seed", type=int, default=12345)
+    parser.add_argument("--save-current-every", type=int, default=10)
+    args = parser.parse_args()
+
+    train(
+        n_episodes=args.episodes,
+        eval_interval=args.eval_interval,
+        eval_episodes=args.eval_episodes,
+        lr=args.lr,
+        grad_clip_norm=args.grad_clip,
+        seed=args.seed,
+        eval_seed=args.eval_seed,
+        save_current_every=args.save_current_every,
+    )
