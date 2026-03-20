@@ -9,13 +9,17 @@ import time
 # - Accelerations are in mm/s^2
 # - Time is in seconds
 
-WIDTH = 15000          # mm
-HEIGHT = 15000         # mm
+WIDTH = 12000          # mm
+HEIGHT = 12000         # mm
 DEBUG = True
 
 GRAVITY = -9800.0     # mm/s^2, downward acceleration
 
 MAX_VEL = 4000        # mm/s
+MAX_OMEGA = 6.0       # rad/s (caps angular velocity)
+MAX_OMEGA_ACC = 25.0  # rad/s^2 (caps angular acceleration kicks)
+OMEGA_ACC_TAU = 0.6   # seconds, time constant for accel decay (smaller => more variation)
+OMEGA_ACC_SIGMA = 12.0 # rad/s^2 * sqrt(s) noise strength for accel drift
 
 
 class Panel:
@@ -50,8 +54,14 @@ class Robot:
         self.ax = 0.0
         self.ay = 0.0
 
+        # Randomize initial velocities so trajectories vary from the first step.
+        self.vx = random.uniform(-0.5 * MAX_VEL, 0.5 * MAX_VEL)
+        self.vy = random.uniform(-0.5 * MAX_VEL, 0.5 * MAX_VEL)
+
         self.theta = 0.0
-        self.omega = 0.0
+        self.omega = random.uniform(-0.5 * MAX_OMEGA, 0.5 * MAX_OMEGA)
+        self.omega_acc = random.uniform(-0.25 * MAX_OMEGA_ACC, 0.25 * MAX_OMEGA_ACC)
+        self._time = 0.0
 
         # Panels are offset vertically from the robot center (mm)
         height1 = random.uniform(-30.0, -10.0)
@@ -103,11 +113,14 @@ class Robot:
             panel.visible = in_fov and facing_camera
 
     def update(self, dt, camera):
+        self._time += float(dt)
+
         # Occasional maneuver
         if random.random() < 0.05:
             self.ax = random.uniform(-750.0, 750.0)
             self.ay = random.uniform(-750.0, 750.0)
-            self.omega = random.uniform(-6.0, 6.0)
+            # Instead of reassigning angular velocity directly, kick angular acceleration.
+            self.omega_acc = random.uniform(-MAX_OMEGA_ACC, MAX_OMEGA_ACC)
 
         # Velocity update
         self.vx += self.ax * dt
@@ -122,6 +135,16 @@ class Robot:
         self.y += self.vy * dt + 0.5 * self.ay * dt * dt
 
         # Rotation
+        # Angular acceleration changes over time, then integrates into omega and theta.
+        #
+        # OU-style drift keeps omega_acc correlated over time.
+        decay = float(dt) / max(float(OMEGA_ACC_TAU), 1e-6)
+        self.omega_acc += (-self.omega_acc) * decay
+        self.omega_acc += OMEGA_ACC_SIGMA * (np.sqrt(float(dt)) * np.random.normal())
+
+        self.omega += self.omega_acc * dt
+        self.omega = float(np.clip(self.omega, -MAX_OMEGA, MAX_OMEGA))
+
         self.theta += self.omega * dt
 
         self.update_panels(camera)
@@ -525,6 +548,124 @@ class Simulator:
             obs.append([x, y, z])
         return np.array(obs)
 
+    def _world_to_camera_frame(self, x, y, z):
+        """
+        Convert world coordinates to camera-centered coordinates.
+        Returns (forward, right, up) in the camera frame.
+        """
+        dx = float(x) - float(self.camera.x)
+        dy = float(y) - float(self.camera.y)
+        dz = float(z) - float(self.camera.z)
+
+        ct = np.cos(self.camera.theta)
+        st = np.sin(self.camera.theta)
+        cp = np.cos(self.camera.pitch)
+        sp = np.sin(self.camera.pitch)
+
+        # Yaw alignment: +forward points where camera yaw points.
+        forward_yaw = ct * dx + st * dy
+        right = -st * dx + ct * dy
+        up_yaw = dz
+
+        # Pitch alignment around camera right axis.
+        forward = cp * forward_yaw + sp * up_yaw
+        up = -sp * forward_yaw + cp * up_yaw
+        return forward, right, up
+
+    def _project_to_overlay(self, x, y, z, cx, cy, focal_px):
+        """
+        Project world point into 2D overlay. Returns (px, py) or None if behind camera.
+        """
+        forward, right, up = self._world_to_camera_frame(x, y, z)
+        if forward <= 1e-3:
+            return None
+        px = int(cx + focal_px * (right / forward))
+        py = int(cy - focal_px * (up / forward))
+        return px, py
+
+    @staticmethod
+    def _wrap_angle(a):
+        return np.arctan2(np.sin(a), np.cos(a))
+
+    def _build_3d_overlay_frame(self, size: int = 760):
+        """
+        Build a dedicated 3D debug frame (returned as an image) for a separate window.
+        """
+        size = int(max(320, size))
+        frame = np.zeros((size, size, 3), dtype=np.uint8)
+        frame[:] = (20, 20, 20)
+
+        cv2.putText(
+            frame,
+            "3D Camera Overlay",
+            (14, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+
+        cx = size // 2
+        cy = size // 2
+        focal_px = 0.85 * (size / 2.0)
+
+        # Crosshair = current aim direction.
+        cv2.line(frame, (cx - 16, cy), (cx + 16, cy), (0, 255, 0), 1)
+        cv2.line(frame, (cx, cy - 16), (cx, cy + 16), (0, 255, 0), 1)
+
+        # Draw panels and robot center in projected 3D.
+        robot_pt = self._project_to_overlay(
+            self.robot.x, self.robot.y, self.robot.z, cx, cy, focal_px
+        )
+        if robot_pt is not None and (0 <= robot_pt[0] < size and 0 <= robot_pt[1] < size):
+            cv2.circle(frame, robot_pt, 4, (255, 255, 255), -1)
+
+        target_panel = self._get_target_panel()
+        for panel in self.robot.panels:
+            p = self._project_to_overlay(panel.x, panel.y, panel.z, cx, cy, focal_px)
+            if p is None:
+                continue
+            if not (0 <= p[0] < size and 0 <= p[1] < size):
+                continue
+            color = (255, 0, 0) if panel.visible else (100, 100, 100)
+            rad = 7 if panel is target_panel else 5
+            cv2.circle(frame, p, rad, color, -1)
+
+        # Draw ideal aim marker/ray so pitch offset is visually obvious.
+        if self.ideal_yaw is not None and self.ideal_pitch is not None:
+            dyaw = self._wrap_angle(float(self.ideal_yaw) - float(self.camera.theta))
+            dpitch = float(self.ideal_pitch) - float(self.camera.pitch)
+            ix = int(cx + focal_px * np.tan(dyaw))
+            iy = int(cy - focal_px * np.tan(dpitch))
+            cv2.line(frame, (cx, cy), (ix, iy), (255, 0, 255), 2)
+            cv2.circle(frame, (ix, iy), 5, (255, 0, 255), -1)
+
+            pitch_err_deg = float(np.rad2deg(dpitch))
+            yaw_err_deg = float(np.rad2deg(dyaw))
+            cv2.putText(
+                frame,
+                f"pitch_err: {pitch_err_deg:+.2f} deg",
+                (14, size - 34),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (220, 220, 220),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                frame,
+                f"yaw_err: {yaw_err_deg:+.2f} deg",
+                (14, size - 12),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (220, 220, 220),
+                1,
+                cv2.LINE_AA,
+            )
+
+        return frame
+
     def render(self):
         """
         Debug rendering using OpenCV. This visualizes the current
@@ -550,8 +691,8 @@ class Simulator:
         fov_right_x = int(self.camera.x + 1000 * np.cos(fov_right_angle))
         fov_right_y = int(self.camera.y + 1000 * np.sin(fov_right_angle))
 
-        cv2.line(canvas, (int(self.camera.x), int(self.camera.y)), (fov_left_x, fov_left_y), (0, 255, 255), 1)
-        cv2.line(canvas, (int(self.camera.x), int(self.camera.y)), (fov_right_x, fov_right_y), (0, 255, 255), 1)
+        cv2.line(canvas, (int(self.camera.x), int(self.camera.y)), (fov_left_x, fov_left_y), (0, 255, 255), 3)
+        cv2.line(canvas, (int(self.camera.x), int(self.camera.y)), (fov_right_x, fov_right_y), (0, 255, 255), 3)
 
         # Draw panels
         for panel in self.robot.panels:
@@ -598,6 +739,7 @@ class Simulator:
 
         debug_view = cv2.resize(canvas, (1000, 1000))
         cv2.imshow("sim", debug_view)
+        cv2.imshow("sim_3d", self._build_3d_overlay_frame(size=760))
         # Small delay to update window; do not block on key here.
         cv2.waitKey(1)
 
@@ -671,6 +813,7 @@ if __name__ == "__main__":
 
             debug_view = cv2.resize(canvas, (1000, 1000))
             cv2.imshow("sim", debug_view)
+            cv2.imshow("sim_3d", sim._build_3d_overlay_frame(size=760))
             key = cv2.waitKey(10)
             if key == 27:
                 break

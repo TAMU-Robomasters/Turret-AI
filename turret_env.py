@@ -33,6 +33,20 @@ class TurretEnv:
         lost_penalty_slope: float = -20.0,
         lost_penalty_cap_steps: int = 50,
         lost_terminal_penalty: float = -5000.0,
+        shot_base_penalty: float = 10.0,
+        shot_miss_penalty_scale: float = 20.0,
+        shot_miss_target_radius_mm: float = 60.0,
+        shot_miss_penalty_power: float = 1.0,
+        shot_miss_max_ratio: float = 5.0,
+        shot_miss_max_angle_deg: float = 45.0,
+        # Alignment reward shaping (camera following ideal lead angle).
+        # - Bonus term uses a linear "align score" that drops to 0 beyond `align_angle_scale_deg`.
+        # - Punishment term uses a smooth quadratic/quartic penalty on angular error.
+        align_bonus_scale: float = 25.0,
+        align_penalty_coeff: float = 600.0,
+        # Lower power makes small angle errors hurt more immediately.
+        align_penalty_power: float = 1.0,
+        align_angle_scale_deg: float = 45.0,
         seed: int | None = None,
     ):
         self.dt = dt
@@ -48,6 +62,16 @@ class TurretEnv:
         self.lost_penalty_slope = float(lost_penalty_slope)
         self.lost_penalty_cap_steps = int(lost_penalty_cap_steps)
         self.lost_terminal_penalty = float(lost_terminal_penalty)
+        self.shot_base_penalty = float(shot_base_penalty)
+        self.shot_miss_penalty_scale = float(shot_miss_penalty_scale)
+        self.shot_miss_target_radius_mm = float(shot_miss_target_radius_mm)
+        self.shot_miss_penalty_power = float(shot_miss_penalty_power)
+        self.shot_miss_max_ratio = float(shot_miss_max_ratio)
+        self.shot_miss_max_angle_deg = float(shot_miss_max_angle_deg)
+        self.align_bonus_scale = float(align_bonus_scale)
+        self.align_penalty_coeff = float(align_penalty_coeff)
+        self.align_penalty_power = float(align_penalty_power)
+        self.align_angle_scale_deg = float(align_angle_scale_deg)
         self.seed = None if seed is None else int(seed)
 
         # Scaling constants for normalization
@@ -254,8 +278,10 @@ class TurretEnv:
         # Shot penalty: small negative reward for each projectile fired
         shots_inc = self.sim.shots_fired - self.prev_shots_fired
         self.prev_shots_fired = self.sim.shots_fired
-        # Stronger penalty per shot to discourage spamming
-        r_shot = -30.0 * shots_inc
+        # Penalize firing, and add an extra miss-distance penalty based on aim error
+        # at the instant the shot is fired (dense learning signal).
+        r_shot_base = -self.shot_base_penalty * shots_inc
+        r_shot_miss = 0.0
         r_blind_fire = 0.0
         if shots_inc > 0:
             visible_cnt = int(getattr(self.sim, "last_shot_visible_panel_count", 0) or 0)
@@ -263,6 +289,32 @@ class TurretEnv:
                 # In the real system you shouldn't be able to score hits on an unseen panel.
                 # Strongly discourage firing when no valid target is visible.
                 r_blind_fire = -500.0 * shots_inc
+            elif self.shot_miss_penalty_scale != 0.0:
+                ideal_yaw = getattr(self.sim, "ideal_yaw", None)
+                ideal_pitch = getattr(self.sim, "ideal_pitch", None)
+                if ideal_yaw is not None and ideal_pitch is not None:
+                    yaw_err = np.arctan2(
+                        np.sin(float(ideal_yaw) - float(self.sim.camera.theta)),
+                        np.cos(float(ideal_yaw) - float(self.sim.camera.theta)),
+                    )
+                    pitch_err = float(ideal_pitch) - float(self.sim.camera.pitch)
+                    angle_err = float(np.sqrt(yaw_err * yaw_err + pitch_err * pitch_err))
+                    max_angle_rad = float(np.deg2rad(max(1e-6, self.shot_miss_max_angle_deg)))
+                    angle_err = float(np.clip(angle_err, 0.0, max_angle_rad))
+
+                    raw = self.sim.get_model_input()
+                    try:
+                        distance_mm = float(raw[5])
+                    except Exception:
+                        distance_mm = 0.0
+
+                    # Approximate lateral miss distance from angular error.
+                    miss_mm = float(distance_mm * np.tan(angle_err))
+                    denom = max(float(self.shot_miss_target_radius_mm), 1e-6)
+                    ratio = miss_mm / denom
+                    ratio = float(np.clip(ratio, 0.0, max(0.0, self.shot_miss_max_ratio)))
+                    power = max(float(self.shot_miss_penalty_power), 1e-6)
+                    r_shot_miss = -self.shot_miss_penalty_scale * (ratio**power) * shots_inc
 
         # Alignment reward: encourage camera to track ideal lead angle
         r_align = 0.0
@@ -271,17 +323,18 @@ class TurretEnv:
                 np.sin(self.sim.ideal_yaw - self.sim.camera.theta),
                 np.cos(self.sim.ideal_yaw - self.sim.camera.theta),
             )
-            pitch_err = self.sim.ideal_pitch - self.sim.camera.pitch
-            angle_err = abs(yaw_err) + abs(pitch_err)
+            pitch_err = float(self.sim.ideal_pitch - self.sim.camera.pitch)
+            angle_err = float(abs(yaw_err) + abs(pitch_err))
 
-            # Higher reward when closely following the ideal line:
-            # map small angular error to a positive bonus, and keep
-            # a mild penalty for being far away.
-            angle_scale = np.deg2rad(45.0)  # beyond this, align bonus ~0
-            align_score = max(0.0, 1.0 - angle_err / max(angle_scale, 1e-6))
-            # Stronger punishment for being off the ideal line.
-            # (angle_err is in radians; typical scale: 0.5 rad ~ 30 degrees)
-            r_align = 10.0 * align_score - 120.0 * angle_err
+            # Following ideal/predicted line:
+            # - bonus drops linearly with error up to `align_angle_scale_deg`
+            # - penalty grows smoothly with a stronger power on error
+            angle_scale = np.deg2rad(max(self.align_angle_scale_deg, 1e-6))
+            align_score = max(0.0, 1.0 - angle_err / max(float(angle_scale), 1e-6))
+            r_align = (
+                self.align_bonus_scale * float(align_score)
+                - self.align_penalty_coeff * (angle_err**self.align_penalty_power)
+            )
 
         # Tracking reward: strongly encourage keeping the target panel in view.
         # If the chosen target panel is visible, reward staying locked on it.
@@ -313,7 +366,16 @@ class TurretEnv:
         self._prev_d_theta = d_theta
         self._prev_d_pitch = d_pitch
 
-        return float(r_hit + r_shot + r_blind_fire + r_align + r_track + r_motion + r_jerk)
+        return float(
+            r_hit
+            + r_shot_base
+            + r_shot_miss
+            + r_blind_fire
+            + r_align
+            + r_track
+            + r_motion
+            + r_jerk
+        )
 
     def _is_done(self) -> bool:
         """Episode termination condition."""
