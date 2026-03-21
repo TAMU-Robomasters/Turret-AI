@@ -457,6 +457,7 @@ def train(
     hidden_dim = int(hidden_dim)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)
 
     # In correction mode, actions are per-step corrections, not absolute yaw/pitch.
     # Keep their range modest; large ranges let the policy "learn" ~pi (180°) flips.
