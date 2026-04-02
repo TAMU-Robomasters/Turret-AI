@@ -845,6 +845,7 @@ class TrainingLogger:
         self,
         log_dir: Optional[str] = None,
         print_interval: int = 1,
+        append: bool = False,
     ):
         self.log_dir = log_dir
         self.print_interval = print_interval
@@ -853,7 +854,8 @@ class TrainingLogger:
         
         if log_dir is not None:
             os.makedirs(log_dir, exist_ok=True)
-            self.log_file = open(os.path.join(log_dir, "training.log"), "w")
+            mode = "a" if append else "w"
+            self.log_file = open(os.path.join(log_dir, "training.log"), mode)
         else:
             self.log_file = None
     
@@ -900,8 +902,8 @@ def train(
     total_timesteps: int = 10_000_000,
     n_steps_per_rollout: int = 128,
     batch_size: int = 512,
-    n_epochs: int = 4,
-    learning_rate: float = 3e-4,
+    n_epochs: int = 2,
+    learning_rate: float = 1e-4,
     # Adaptive LR (reward-plateau based, optional)
     adaptive_lr: bool = True,
     adaptive_lr_factor: float = 1.01,
@@ -917,8 +919,8 @@ def train(
     max_grad_norm: float = 0.5,
     target_kl: Optional[float] = None,
     # Policy
-    hidden_dim: int = 128,
-    num_layers: int = 8,
+    hidden_dim: int = 16,
+    num_layers: int = 16,
     use_actor_critic: bool = True,
     # Exploration
     policy_std_init: float = 0.5,
@@ -1073,7 +1075,7 @@ def train(
     
     # Setup logging and checkpointing
     os.makedirs(save_dir, exist_ok=True)
-    logger = TrainingLogger(log_dir=save_dir, print_interval=log_interval)
+    logger = TrainingLogger(log_dir=save_dir, print_interval=log_interval, append=bool(resume))
     
     # Training state
     best_eval_reward = -float('inf')
@@ -1082,6 +1084,7 @@ def train(
     total_steps = 0
     n_updates = 0
     start_time = time.time()
+    start_iteration = 1
     
     # Calculate iterations needed
     steps_per_iteration = n_envs * n_steps_per_rollout
@@ -1096,11 +1099,30 @@ def train(
     print(f"  PPO epochs: {n_epochs}")
     print(f"{'='*60}\n")
     
+    # Resume from checkpoint if provided
+    if resume:
+        ckpt = torch.load(resume, map_location=device)
+        if "policy_state_dict" in ckpt:
+            policy.load_state_dict(ckpt["policy_state_dict"], strict=False)
+        if value_net is not None and ckpt.get("value_state_dict") is not None:
+            value_net.load_state_dict(ckpt["value_state_dict"], strict=False)
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if value_optimizer is not None and ckpt.get("value_optimizer_state_dict") is not None:
+            value_optimizer.load_state_dict(ckpt["value_optimizer_state_dict"])
+        resume_iter = int(ckpt.get("iteration", 0) or 0)
+        total_steps = int(ckpt.get("total_steps", resume_iter * steps_per_iteration) or 0)
+        n_updates = int(ckpt.get("progress/updates", resume_iter) or resume_iter)
+        best_eval_reward = float(ckpt.get("eval_reward", best_eval_reward))
+        start_iteration = resume_iter + 1
+        logger.iteration = resume_iter
+        print(f"Resumed from iteration {resume_iter}, total_steps={total_steps:,}")
+    
     # Reset environment
     env.reset()
     
     # Main training loop
-    for iteration in range(1, total_iterations + 1):
+    for iteration in range(start_iteration, total_iterations + 1):
         iter_start = time.time()
         
         # Collect rollouts
@@ -1302,7 +1324,7 @@ def parse_args():
     
     # Environment
     env_group = parser.add_argument_group("Environment")
-    env_group.add_argument("--n-envs", type=int, default=256,
+    env_group.add_argument("--n-envs", type=int, default=128,
                           help="Number of parallel environments")
     env_group.add_argument("--max-steps", type=int, default=500,
                           help="Max steps per episode")
@@ -1315,11 +1337,11 @@ def parse_args():
                             help="Total environment steps")
     train_group.add_argument("--n-steps", type=int, default=128,
                             help="Steps per rollout before update")
-    train_group.add_argument("--batch-size", type=int, default=512,
+    train_group.add_argument("--batch-size", type=int, default=128,
                             help="Mini-batch size for updates")
-    train_group.add_argument("--n-epochs", type=int, default=4,
+    train_group.add_argument("--n-epochs", type=int, default=2,
                             help="PPO epochs per update")
-    train_group.add_argument("--lr", type=float, default=3e-4,
+    train_group.add_argument("--lr", type=float, default=1e-4,
                             help="Learning rate")
     train_group.add_argument("--adaptive-lr", action="store_true", default=False,
                             help="Increase LR when eval reward plateaus")
@@ -1338,7 +1360,7 @@ def parse_args():
     
     # PPO
     ppo_group = parser.add_argument_group("PPO")
-    ppo_group.add_argument("--clip-coef", type=float, default=0.2,
+    ppo_group.add_argument("--clip-coef", type=float, default=0.05,
                           help="PPO clipping coefficient")
     ppo_group.add_argument("--value-coef", type=float, default=0.5,
                           help="Value loss coefficient")
@@ -1346,12 +1368,12 @@ def parse_args():
                           help="Entropy bonus coefficient")
     ppo_group.add_argument("--max-grad-norm", type=float, default=0.5,
                           help="Max gradient norm for clipping")
-    ppo_group.add_argument("--target-kl", type=float, default=None,
+    ppo_group.add_argument("--target-kl", type=float, default=0.02,
                           help="Target KL for early stopping (None to disable)")
     
     # Model
     model_group = parser.add_argument_group("Model")
-    model_group.add_argument("--hidden-dim", type=int, default=256,
+    model_group.add_argument("--hidden-dim", type=int, default=16,
                             help="Hidden layer dimension")
     model_group.add_argument("--num-layers", type=int, default=16,
                             help="Number of recurrent layers")
