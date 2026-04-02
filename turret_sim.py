@@ -20,6 +20,10 @@ MAX_OMEGA = 6.0       # rad/s (caps angular velocity)
 MAX_OMEGA_ACC = 25.0  # rad/s^2 (caps angular acceleration kicks)
 OMEGA_ACC_TAU = 0.6   # seconds, time constant for accel decay (smaller => more variation)
 OMEGA_ACC_SIGMA = 12.0 # rad/s^2 * sqrt(s) noise strength for accel drift
+# Spin behavior (match CUDA defaults)
+SPIN_RATE = 9.0
+SPIN_RATE_STD = 4
+SPIN_NOISE_STD = 0.02
 
 
 class Panel:
@@ -59,8 +63,12 @@ class Robot:
         self.vy = random.uniform(-0.5 * MAX_VEL, 0.5 * MAX_VEL)
 
         self.theta = 0.0
-        self.omega = random.uniform(-0.5 * MAX_OMEGA, 0.5 * MAX_OMEGA)
-        self.omega_acc = random.uniform(-0.25 * MAX_OMEGA_ACC, 0.25 * MAX_OMEGA_ACC)
+        base = random.gauss(SPIN_RATE, SPIN_RATE_STD)
+        if random.random() < 0.5:
+            base = -base
+        self.omega_base = float(np.clip(base, -MAX_OMEGA, MAX_OMEGA))
+        self.omega = self.omega_base
+        self.omega_acc = 0.0
         self._time = 0.0
 
         # Panels are offset vertically from the robot center (mm)
@@ -115,12 +123,10 @@ class Robot:
     def update(self, dt, camera):
         self._time += float(dt)
 
-        # Occasional maneuver
+        # Occasional maneuver (linear only; keep spin consistent)
         if random.random() < 0.05:
             self.ax = random.uniform(-750.0, 750.0)
             self.ay = random.uniform(-750.0, 750.0)
-            # Instead of reassigning angular velocity directly, kick angular acceleration.
-            self.omega_acc = random.uniform(-MAX_OMEGA_ACC, MAX_OMEGA_ACC)
 
         # Velocity update
         self.vx += self.ax * dt
@@ -134,16 +140,9 @@ class Robot:
         self.x += self.vx * dt + 0.5 * self.ax * dt * dt
         self.y += self.vy * dt + 0.5 * self.ay * dt * dt
 
-        # Rotation
-        # Angular acceleration changes over time, then integrates into omega and theta.
-        #
-        # OU-style drift keeps omega_acc correlated over time.
-        decay = float(dt) / max(float(OMEGA_ACC_TAU), 1e-6)
-        self.omega_acc += (-self.omega_acc) * decay
-        self.omega_acc += OMEGA_ACC_SIGMA * (np.sqrt(float(dt)) * np.random.normal())
-
-        self.omega += self.omega_acc * dt
-        self.omega = float(np.clip(self.omega, -MAX_OMEGA, MAX_OMEGA))
+        # Rotation (constant spin with small noise)
+        noise = SPIN_NOISE_STD * np.sqrt(float(dt)) * np.random.normal()
+        self.omega = float(np.clip(self.omega_base + noise, -MAX_OMEGA, MAX_OMEGA))
 
         self.theta += self.omega * dt
 
@@ -330,7 +329,7 @@ class Simulator:
         self.projectiles.append(proj)
         self.shots_fired += 1
 
-    def _update_projectiles(self, dt, hit_tol_mm=100.0):
+    def _update_projectiles(self, dt, hit_tol_mm=60.0):
         alive_projectiles = []
         for proj in self.projectiles:
             proj.update(dt)
@@ -339,14 +338,18 @@ class Simulator:
 
             hit = False
             for idx, panel in enumerate(self.robot.panels):
-                if proj.allowed_panel_indices and idx not in proj.allowed_panel_indices:
-                    continue
-                # 3D positional tolerance check (sphere of radius hit_tol_mm)
+                # XY-only positional tolerance check (ignore Z)
                 dx = proj.x - panel.x
                 dy = proj.y - panel.y
-                dz = proj.z - panel.z
-                dist = np.sqrt(dx * dx + dy * dy + dz * dz)
-                if dist <= hit_tol_mm:
+                dist = np.sqrt(dx * dx + dy * dy)
+                # Only count hits on panels facing the camera (prevents back-side hits).
+                theta = self.robot.theta + panel.base_theta
+                nx = np.cos(theta)
+                ny = np.sin(theta)
+                vx = self.camera.x - panel.x
+                vy = self.camera.y - panel.y
+                facing_camera = (nx * vx + ny * vy) > 0
+                if dist <= hit_tol_mm and facing_camera:
                     hit = True
                     if DEBUG:
                         print("hit")
@@ -460,10 +463,7 @@ class Simulator:
         current state and a single target panel.
 
         Features (all scalars):
-        - camera_yaw
-        - camera_pitch
         - yaw_to_panel        (global yaw from camera to panel)
-        - pitch_to_panel      (global pitch from camera to panel)
         - panel_yaw_world     (panel outward normal yaw in world frame)
         - distance_to_panel   (3D distance, mm)
         - projectile_speed    (mm/s)
@@ -471,19 +471,17 @@ class Simulator:
         target = self._get_target_panel()
         if target is None:
             # No panels (should not happen), return zeros
-            return np.zeros(7, dtype=float)
+            return np.zeros(4, dtype=float)
 
         # Relative position from camera to panel (mm)
         rel_x = target.x - self.camera.x
         rel_y = target.y - self.camera.y
         rel_z = target.z - self.camera.z
 
-        horiz_dist = np.hypot(rel_x, rel_y)
         distance = np.sqrt(rel_x * rel_x + rel_y * rel_y + rel_z * rel_z)
 
-        # Global yaw/pitch from camera to panel
+        # Global yaw to panel
         yaw_to_panel = np.arctan2(rel_y, rel_x)
-        pitch_to_panel = np.arctan2(rel_z, horiz_dist) if horiz_dist > 1e-6 else 0.0
 
         # Panel outward normal yaw (world), then relative to camera yaw
         # Recompute panel orientation the same way as in update_panels.
@@ -492,10 +490,7 @@ class Simulator:
 
         features = np.array(
             [
-                self.camera.theta,
-                self.camera.pitch,
                 yaw_to_panel,
-                pitch_to_panel,
                 panel_yaw_world,
                 distance,
                 self.projectile_speed,
@@ -628,7 +623,14 @@ class Simulator:
                 continue
             if not (0 <= p[0] < size and 0 <= p[1] < size):
                 continue
-            color = (255, 0, 0) if panel.visible else (100, 100, 100)
+            # Facing test (front side = green, back side = red)
+            theta = self.robot.theta + panel.base_theta
+            nx = np.cos(theta)
+            ny = np.sin(theta)
+            vx = self.camera.x - panel.x
+            vy = self.camera.y - panel.y
+            facing = (nx * vx + ny * vy) > 0
+            color = (0, 255, 0) if facing else (0, 0, 255)
             rad = 7 if panel is target_panel else 5
             cv2.circle(frame, p, rad, color, -1)
 

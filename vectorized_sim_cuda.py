@@ -31,6 +31,10 @@ class VectorizedSimulator:
         device: torch.device,
         projectile_speed: float = 23000.0,
         max_projectiles: int = 32,
+        spin_mode: str = "constant",
+        spin_rate: float = 9.0,
+        spin_rate_std: float = 4.0,
+        spin_noise_std: float = 0.02,
         dtype: torch.dtype = torch.float32,
     ):
         self.n_envs = n_envs
@@ -38,6 +42,10 @@ class VectorizedSimulator:
         self.dtype = dtype
         self.projectile_speed = projectile_speed
         self.max_projectiles = max_projectiles
+        self.spin_mode = str(spin_mode).lower().strip()
+        self.spin_rate = float(spin_rate)
+        self.spin_rate_std = float(spin_rate_std)
+        self.spin_noise_std = float(spin_noise_std)
         
         # Pre-compute constants on device
         self._panel_base_thetas = torch.tensor(
@@ -75,6 +83,7 @@ class VectorizedSimulator:
         self.robot_theta = torch.zeros(N, device=device, dtype=dtype)
         self.robot_omega = torch.zeros(N, device=device, dtype=dtype)
         self.robot_omega_acc = torch.zeros(N, device=device, dtype=dtype)
+        self.robot_omega_base = torch.zeros(N, device=device, dtype=dtype)
         
         # === Panel state (N, NUM_PANELS) ===
         self.panel_x = torch.zeros(N, NUM_PANELS, device=device, dtype=dtype)
@@ -163,8 +172,18 @@ class VectorizedSimulator:
         
         # Random initial angular state
         self.robot_theta[env_mask] = 0.0
-        self.robot_omega[env_mask] = (torch.rand(n_reset, device=device, dtype=dtype) - 0.5) * MAX_OMEGA
-        self.robot_omega_acc[env_mask] = (torch.rand(n_reset, device=device, dtype=dtype) - 0.5) * 0.5 * MAX_OMEGA_ACC
+        if self.spin_mode == "constant":
+            base = torch.randn(n_reset, device=device, dtype=dtype) * self.spin_rate_std + self.spin_rate
+            # Allow both spin directions
+            sign = torch.where(torch.rand(n_reset, device=device, dtype=dtype) > 0.5, 1.0, -1.0)
+            base = base * sign
+            base = torch.clamp(base, -MAX_OMEGA, MAX_OMEGA)
+            self.robot_omega_base[env_mask] = base
+            self.robot_omega[env_mask] = base
+            self.robot_omega_acc[env_mask] = 0.0
+        else:
+            self.robot_omega[env_mask] = (torch.rand(n_reset, device=device, dtype=dtype) - 0.5) * MAX_OMEGA
+            self.robot_omega_acc[env_mask] = (torch.rand(n_reset, device=device, dtype=dtype) - 0.5) * 0.5 * MAX_OMEGA_ACC
         
         # Panel z offsets
         h1 = torch.rand(n_reset, device=device, dtype=dtype) * (-20) - 10
@@ -239,6 +258,7 @@ class VectorizedSimulator:
         
         # Facing camera if dot product > 0
         facing_camera = (nx * vx + ny * vy) > 0
+        self.panel_facing = facing_camera
         
         # Visible = in FOV AND facing camera
         self.panel_visible = in_fov & facing_camera
@@ -262,10 +282,11 @@ class VectorizedSimulator:
             self.robot_ay[maneuver_mask] = (
                 torch.rand(n_maneuver, device=self.device, dtype=self.dtype) - 0.5
             ) * 1500.0
-            # Random angular acceleration kick
-            self.robot_omega_acc[maneuver_mask] = (
-                torch.rand(n_maneuver, device=self.device, dtype=self.dtype) - 0.5
-            ) * 2.0 * MAX_OMEGA_ACC
+            if self.spin_mode != "constant":
+                # Random angular acceleration kick
+                self.robot_omega_acc[maneuver_mask] = (
+                    torch.rand(n_maneuver, device=self.device, dtype=self.dtype) - 0.5
+                ) * 2.0 * MAX_OMEGA_ACC
         
         # === Linear Velocity Update ===
         self.robot_vx = self.robot_vx + self.robot_ax * dt
@@ -279,17 +300,23 @@ class VectorizedSimulator:
         self.robot_x = self.robot_x + self.robot_vx * dt + 0.5 * self.robot_ax * dt * dt
         self.robot_y = self.robot_y + self.robot_vy * dt + 0.5 * self.robot_ay * dt * dt
         
-        # === Angular Dynamics (Ornstein-Uhlenbeck process) ===
-        decay = dt / OMEGA_ACC_TAU
-        noise = torch.randn(self.n_envs, device=self.device, dtype=self.dtype)
-        
-        # OU update for angular acceleration
-        self.robot_omega_acc = self.robot_omega_acc * (1.0 - decay)
-        self.robot_omega_acc = self.robot_omega_acc + OMEGA_ACC_SIGMA * torch.sqrt(dt) * noise
-        
-        # Integrate angular velocity and position
-        self.robot_omega = self.robot_omega + self.robot_omega_acc * dt
-        self.robot_omega = torch.clamp(self.robot_omega, -MAX_OMEGA, MAX_OMEGA)
+        # === Angular Dynamics ===
+        if self.spin_mode == "constant":
+            noise = torch.randn(self.n_envs, device=self.device, dtype=self.dtype)
+            self.robot_omega = self.robot_omega_base + self.spin_noise_std * torch.sqrt(dt) * noise
+            self.robot_omega = torch.clamp(self.robot_omega, -MAX_OMEGA, MAX_OMEGA)
+        else:
+            # Ornstein-Uhlenbeck process
+            decay = dt / OMEGA_ACC_TAU
+            noise = torch.randn(self.n_envs, device=self.device, dtype=self.dtype)
+            
+            # OU update for angular acceleration
+            self.robot_omega_acc = self.robot_omega_acc * (1.0 - decay)
+            self.robot_omega_acc = self.robot_omega_acc + OMEGA_ACC_SIGMA * torch.sqrt(dt) * noise
+            
+            # Integrate angular velocity and position
+            self.robot_omega = self.robot_omega + self.robot_omega_acc * dt
+            self.robot_omega = torch.clamp(self.robot_omega, -MAX_OMEGA, MAX_OMEGA)
         self.robot_theta = self.robot_theta + self.robot_omega * dt
         
         # === Boundary Clamping ===
@@ -338,7 +365,7 @@ class VectorizedSimulator:
             self.robot_vy
         )
 
-    def _update_projectiles(self, dt: torch.Tensor, hit_tol_mm: float = 100.0) -> torch.Tensor:
+    def _update_projectiles(self, dt: torch.Tensor, hit_tol_mm: float = 60.0) -> torch.Tensor:
         """
         Update all projectiles and check for hits (vectorized).
         
@@ -379,17 +406,15 @@ class VectorizedSimulator:
         
         dx = self.proj_x.unsqueeze(2) - self.panel_x.unsqueeze(1)  # (N, max_proj, NUM_PANELS)
         dy = self.proj_y.unsqueeze(2) - self.panel_y.unsqueeze(1)
-        dz = self.proj_z.unsqueeze(2) - self.panel_z.unsqueeze(1)
-        
-        dist_sq = dx * dx + dy * dy + dz * dz
+        # XY-only hit detection (ignore Z)
+        dist_sq = dx * dx + dy * dy
         dist = torch.sqrt(dist_sq)
         
         # Check if within hit tolerance
         within_range = dist <= hit_tol_mm  # (N, max_proj, NUM_PANELS)
         
-        # Check if panel was allowed for this projectile
-        # proj_allowed_panels: (N, max_proj, NUM_PANELS)
-        allowed = self.proj_allowed_panels
+        # Allow hits on any panel that is facing the camera (no "visible-at-fire" gating).
+        allowed = self.panel_facing.unsqueeze(1)
         
         # Hit = alive AND within_range AND allowed (for at least one panel)
         hit_panel = within_range & allowed & self.proj_alive.unsqueeze(2)  # (N, max_proj, NUM_PANELS)
@@ -676,9 +701,9 @@ class VectorizedSimulator:
         Get normalized observation features for all environments.
         
         Returns:
-            obs: (N, 7) tensor of normalized features:
-                [camera_yaw/pi, camera_pitch/pi, yaw_to_panel/pi, pitch_to_panel/pi,
-                 panel_yaw_world/pi, distance_normalized, speed_normalized]
+            obs: (N, 4) tensor of normalized features:
+                [yaw_to_panel/pi, panel_yaw_world/pi,
+                 distance_normalized, speed_normalized]
         """
         # Get target panel for each env
         target_idx = self._get_target_panel_idx()  # (N,)
@@ -698,13 +723,8 @@ class VectorizedSimulator:
         horiz_dist = torch.sqrt(rel_x * rel_x + rel_y * rel_y)
         distance = torch.sqrt(rel_x * rel_x + rel_y * rel_y + rel_z * rel_z)
         
-        # Yaw/pitch to panel
+        # Yaw to panel
         yaw_to_panel = torch.atan2(rel_y, rel_x)
-        pitch_to_panel = torch.where(
-            horiz_dist > 1e-6,
-            torch.atan2(rel_z, horiz_dist),
-            torch.zeros_like(rel_z)
-        )
         
         # Panel outward normal yaw (world frame)
         panel_theta = self.robot_theta + self._panel_base_thetas[target_idx]
@@ -716,15 +736,12 @@ class VectorizedSimulator:
         
         # Build feature tensor
         obs = torch.stack([
-            self.camera_theta / math.pi,
-            self.camera_pitch / math.pi,
             yaw_to_panel / math.pi,
-            pitch_to_panel / math.pi,
             panel_yaw_world / math.pi,
             distance / max_distance,
-            torch.full((self.n_envs,), self.projectile_speed / speed_scale, 
+            torch.full((self.n_envs,), self.projectile_speed / speed_scale,
                        device=self.device, dtype=self.dtype),
-        ], dim=1)  # (N, 7)
+        ], dim=1)  # (N, 4)
         
         return obs
 

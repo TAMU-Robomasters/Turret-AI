@@ -25,8 +25,6 @@ from models_cuda import (
     create_policy,
     create_value_network,
     create_actor_critic,
-    PolicyGRUCUDA,
-    PolicyLSTMCUDA,
     ActorCriticGRUCUDA,
 )
 
@@ -364,13 +362,7 @@ def collect_rollouts(
             # Zero out hidden states for done envs
             done_idx = done.nonzero(as_tuple=True)[0]
             if hidden is not None:
-                if isinstance(hidden, tuple):
-                    # LSTM
-                    hidden[0][:, done_idx, :] = 0
-                    hidden[1][:, done_idx, :] = 0
-                else:
-                    # GRU
-                    hidden[:, done_idx, :] = 0
+                hidden[:, done_idx, :] = 0
         
         obs = next_obs
     
@@ -405,100 +397,6 @@ def collect_rollouts(
     if episode_rewards:
         stats["rollout/ep_reward_mean"] = np.mean(episode_rewards)
         stats["rollout/ep_reward_std"] = np.std(episode_rewards) if len(episode_rewards) > 1 else 0
-        stats["rollout/ep_length_mean"] = np.mean(episode_lengths)
-        stats["rollout/episodes_completed"] = len(episode_rewards)
-    
-    return stats
-
-
-@torch.no_grad()
-def collect_rollouts_with_obs_history(
-    env: VectorizedTurretEnv,
-    policy: nn.Module,
-    buffer: RolloutBuffer,
-    value_net: Optional[nn.Module] = None,
-    n_steps: Optional[int] = None,
-    obs_history_k: int = 1,
-    deterministic: bool = False,
-) -> Dict[str, float]:
-    """
-    Collect rollouts with observation history stacking (for MLP policies).
-    
-    Maintains a rolling window of the last k observations per environment.
-    """
-    if n_steps is None:
-        n_steps = buffer.n_steps
-    
-    buffer.reset()
-    
-    # Initialize observation history buffer: (N, k, obs_dim)
-    base_obs = env._get_obs()
-    obs_history = base_obs.unsqueeze(1).repeat(1, obs_history_k, 1)  # (N, k, obs_dim)
-    
-    # Flatten for policy: (N, k * obs_dim)
-    obs_flat = obs_history.reshape(env.n_envs, -1)
-    
-    episode_rewards = []
-    episode_lengths = []
-    
-    for step in range(n_steps):
-        # Get action and value
-        action, log_prob, _ = policy.sample_action(obs_flat, None, deterministic=deterministic)
-        
-        if value_net is not None:
-            value = value_net(obs_flat)
-        else:
-            value = torch.zeros(env.n_envs, device=env.device)
-        
-        # Step environment
-        next_obs, reward, done, info = env.step(action)
-        
-        # Store in buffer (store flattened obs)
-        buffer.add(
-            obs=obs_flat,
-            action=action,
-            log_prob=log_prob,
-            reward=reward,
-            done=done,
-            value=value,
-        )
-        
-        # Track episodes
-        if "episode_done" in info:
-            ep_done_mask = info["episode_done"]
-            if ep_done_mask.any():
-                episode_rewards.extend(info["episode_return"][ep_done_mask].cpu().tolist())
-                episode_lengths.extend(info["episode_length"][ep_done_mask].cpu().tolist())
-        
-        # Update observation history
-        # Shift history and add new observation
-        obs_history = torch.roll(obs_history, shifts=-1, dims=1)
-        obs_history[:, -1, :] = next_obs
-        
-        # Reset history for done environments
-        if done.any():
-            done_idx = done.nonzero(as_tuple=True)[0]
-            obs_history[done_idx] = next_obs[done_idx].unsqueeze(1).repeat(1, obs_history_k, 1)
-        
-        obs_flat = obs_history.reshape(env.n_envs, -1)
-    
-    # Compute last values
-    if value_net is not None:
-        last_value = value_net(obs_flat)
-    else:
-        last_value = torch.zeros(env.n_envs, device=env.device)
-    
-    buffer.compute_returns_and_advantages(last_value, done)
-    
-    stats = {
-        "rollout/reward_mean": buffer.rewards.mean().item(),
-        "rollout/reward_std": buffer.rewards.std().item(),
-        "rollout/value_mean": buffer.values.mean().item(),
-        "rollout/return_mean": buffer.returns.mean().item(),
-    }
-    
-    if episode_rewards:
-        stats["rollout/ep_reward_mean"] = np.mean(episode_rewards)
         stats["rollout/ep_length_mean"] = np.mean(episode_lengths)
         stats["rollout/episodes_completed"] = len(episode_rewards)
     
@@ -1004,6 +902,12 @@ def train(
     batch_size: int = 512,
     n_epochs: int = 4,
     learning_rate: float = 3e-4,
+    # Adaptive LR (reward-plateau based, optional)
+    adaptive_lr: bool = True,
+    adaptive_lr_factor: float = 1.01,
+    adaptive_lr_patience: int = 10,
+    adaptive_lr_min_delta: float = 1.0,
+    adaptive_lr_max: float = 1e-2,
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
     # PPO
@@ -1013,11 +917,9 @@ def train(
     max_grad_norm: float = 0.5,
     target_kl: Optional[float] = None,
     # Policy
-    model_type: str = "gru",
-    hidden_dim: int = 256,
-    num_layers: int = 1,
+    hidden_dim: int = 128,
+    num_layers: int = 8,
     use_actor_critic: bool = True,
-    obs_history_k: int = 1,  # For MLP
     # Exploration
     policy_std_init: float = 0.5,
     policy_std_decay: float = 0.9999,
@@ -1025,6 +927,7 @@ def train(
     # Evaluation
     eval_interval: int = 10,
     eval_episodes: int = 50,
+    eval_deterministic: bool = False,
     # Checkpointing
     save_interval: int = 50,
     save_dir: str = "checkpoints",
@@ -1033,10 +936,12 @@ def train(
     use_amp: bool = True,
     log_interval: int = 1,
     # Reward shaping
-    shot_base_penalty: float = 10.0,
-    shot_miss_penalty_scale: float = 20.0,
-    align_bonus_scale: float = 25.0,
-    align_penalty_coeff: float = 600.0,
+    shot_base_penalty: float = 0.0,
+    shot_miss_penalty_scale: float = 0.0,
+    miss_penalty: float = 150.0,
+    hit_reward: float = 200.0,
+    predicted_yaw_slope: float = 10.0,
+    predicted_yaw_tolerance_deg: float = 2.0,
 ):
     """
     Main training loop.
@@ -1048,7 +953,9 @@ def train(
         ... (see argument descriptions above)
     """
     # Setup device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required but not available. Check your NVIDIA driver/CUDA setup.")
+    device = torch.device("cuda")
     print(f"Using device: {device}")
     
     if device.type == "cuda":
@@ -1069,20 +976,20 @@ def train(
         auto_reset=True,
         dt=dt,
         max_steps=max_steps_per_episode,
+        obs_history_k=4,
         action_is_correction=True,
         shot_base_penalty=shot_base_penalty,
         shot_miss_penalty_scale=shot_miss_penalty_scale,
-        align_bonus_scale=align_bonus_scale,
-        align_penalty_coeff=align_penalty_coeff,
+        miss_penalty=miss_penalty,
+        hit_reward=hit_reward,
+        predicted_yaw_slope=predicted_yaw_slope,
+        predicted_yaw_tolerance_deg=predicted_yaw_tolerance_deg,
     )
     
     obs_dim = env.obs_dim
-    action_dim = 3
+    action_dim = 2
     
-    if model_type == "mlp" and obs_history_k > 1:
-        effective_obs_dim = obs_dim * obs_history_k
-    else:
-        effective_obs_dim = obs_dim
+    effective_obs_dim = obs_dim
     
     print(f"Observation dim: {obs_dim} (effective: {effective_obs_dim})")
     print(f"Action dim: {action_dim}")
@@ -1090,13 +997,13 @@ def train(
     # Action bounds (corrections)
     correction_yaw_max = float(np.deg2rad(30.0))
     correction_pitch_max = float(np.deg2rad(15.0))
-    action_low = [-correction_yaw_max, -correction_pitch_max, 0.0]
-    action_high = [correction_yaw_max, correction_pitch_max, 1.0]
+    action_low = [-correction_yaw_max, 0.0]
+    action_high = [correction_yaw_max, 1.0]
     
     # Create networks
-    print(f"\nCreating {model_type.upper()} policy (hidden_dim={hidden_dim})...")
+    print(f"\nCreating GRU policy (hidden_dim={hidden_dim})...")
     
-    if use_actor_critic and model_type in ["gru", "lstm"]:
+    if use_actor_critic:
         # Combined actor-critic
         policy = create_actor_critic(
             obs_dim=effective_obs_dim,
@@ -1115,7 +1022,7 @@ def train(
     else:
         # Separate policy and value networks
         policy = create_policy(
-            model_type=model_type,
+            model_type="gru",
             obs_dim=effective_obs_dim,
             hidden_dim=hidden_dim,
             action_dim=action_dim,
@@ -1123,14 +1030,15 @@ def train(
             action_low=action_low,
             action_high=action_high,
             num_layers=num_layers,
-            obs_history_k=obs_history_k,
+            obs_history_k=4,
         )
         
         value_net = create_value_network(
-            model_type="mlp",  # MLP value net is usually sufficient
+            model_type="gru",
             obs_dim=effective_obs_dim,
             hidden_dim=hidden_dim,
             device=device,
+            num_layers=num_layers,
         )
         
         optimizer = optim.Adam(policy.parameters(), lr=learning_rate)
@@ -1169,6 +1077,8 @@ def train(
     
     # Training state
     best_eval_reward = -float('inf')
+    last_eval_reward = None
+    eval_plateau_count = 0
     total_steps = 0
     n_updates = 0
     start_time = time.time()
@@ -1196,21 +1106,12 @@ def train(
         # Collect rollouts
         policy.eval()
         
-        if model_type == "mlp" and obs_history_k > 1:
-            rollout_stats = collect_rollouts_with_obs_history(
-                env=env,
-                policy=policy,
-                buffer=buffer,
-                value_net=value_net,
-                obs_history_k=obs_history_k,
-            )
-        else:
-            rollout_stats = collect_rollouts(
-                env=env,
-                policy=policy,
-                buffer=buffer,
-                value_net=value_net,
-            )
+        rollout_stats = collect_rollouts(
+            env=env,
+            policy=policy,
+            buffer=buffer,
+            value_net=value_net,
+        )
         
         total_steps += steps_per_iteration
         
@@ -1219,7 +1120,7 @@ def train(
         if value_net is not None:
             value_net.train()
         
-        is_recurrent = model_type in ["gru", "lstm"]
+        is_recurrent = True
         
         if is_recurrent and not isinstance(policy, ActorCriticGRUCUDA):
             # Use sequence-based PPO for recurrent
@@ -1262,14 +1163,16 @@ def train(
         # Decay exploration std
         if hasattr(policy, 'decay_std'):
             policy.decay_std(policy_std_decay, policy_std_min)
+
         
         # Compute timing
         iter_time = time.time() - iter_start
         total_time = time.time() - start_time
         steps_per_sec = total_steps / total_time
-        
         # Get current std
-        if hasattr(policy, 'log_std'):
+        if hasattr(policy, '_get_std'):
+            current_std = policy._get_std().mean().item()
+        elif hasattr(policy, 'log_std'):
             current_std = policy.log_std.exp().mean().item()
         else:
             current_std = 0.0
@@ -1285,7 +1188,16 @@ def train(
             "progress/updates": n_updates,
             "policy/std": current_std,
         }
-        
+
+        # Early stop on NaN/inf to avoid corrupting checkpoints/logs
+        bad_keys = []
+        for k, v in metrics.items():
+            if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                bad_keys.append(k)
+        if bad_keys:
+            print("\nEarly stop: NaN/inf detected in metrics: " + ", ".join(bad_keys))
+            print(f"Stopped at iteration {iteration}, total_steps={total_steps:,}")
+            break
         logger.log(metrics, iteration)
         
         # Evaluation
@@ -1295,7 +1207,7 @@ def train(
                 env=env,
                 policy=policy,
                 n_episodes=eval_episodes,
-                deterministic=True,
+                deterministic=eval_deterministic,
             )
             
             for k, v in eval_stats.items():
@@ -1318,6 +1230,29 @@ def train(
                 print(f"  New best model saved! Reward: {best_eval_reward:.2f}")
             
             print()
+
+            # Adaptive LR: increase when reward plateaus
+            if adaptive_lr:
+                current_eval = float(eval_stats["eval/reward_mean"])
+                if last_eval_reward is None:
+                    last_eval_reward = current_eval
+                    eval_plateau_count = 0
+                else:
+                    if current_eval <= last_eval_reward + float(adaptive_lr_min_delta):
+                        eval_plateau_count += 1
+                    else:
+                        eval_plateau_count = 0
+                    last_eval_reward = current_eval
+
+                if eval_plateau_count >= int(adaptive_lr_patience):
+                    for opt in [optimizer, value_optimizer]:
+                        if opt is None:
+                            continue
+                        for group in opt.param_groups:
+                            new_lr = min(group["lr"] * float(adaptive_lr_factor), float(adaptive_lr_max))
+                            group["lr"] = new_lr
+                    eval_plateau_count = 0
+                    print(f"  Adaptive LR: increased to {optimizer.param_groups[0]['lr']:.6f}")
         
         # Periodic checkpointing
         if iteration % save_interval == 0:
@@ -1376,7 +1311,7 @@ def parse_args():
     
     # Training
     train_group = parser.add_argument_group("Training")
-    train_group.add_argument("--total-timesteps", type=int, default=10_000_000,
+    train_group.add_argument("--total-timesteps", type=int, default=50_000_000,
                             help="Total environment steps")
     train_group.add_argument("--n-steps", type=int, default=128,
                             help="Steps per rollout before update")
@@ -1386,6 +1321,16 @@ def parse_args():
                             help="PPO epochs per update")
     train_group.add_argument("--lr", type=float, default=3e-4,
                             help="Learning rate")
+    train_group.add_argument("--adaptive-lr", action="store_true", default=False,
+                            help="Increase LR when eval reward plateaus")
+    train_group.add_argument("--adaptive-lr-factor", type=float, default=1.2,
+                            help="LR multiply factor on plateau")
+    train_group.add_argument("--adaptive-lr-patience", type=int, default=3,
+                            help="Eval checks to wait before increasing LR")
+    train_group.add_argument("--adaptive-lr-min-delta", type=float, default=1.0,
+                            help="Min eval improvement to reset plateau")
+    train_group.add_argument("--adaptive-lr-max", type=float, default=1e-3,
+                            help="Max LR cap for adaptive increases")
     train_group.add_argument("--gamma", type=float, default=0.99,
                             help="Discount factor")
     train_group.add_argument("--gae-lambda", type=float, default=0.95,
@@ -1406,23 +1351,18 @@ def parse_args():
     
     # Model
     model_group = parser.add_argument_group("Model")
-    model_group.add_argument("--model", type=str, default="gru",
-                            choices=["gru", "lstm", "mlp"],
-                            help="Policy architecture")
     model_group.add_argument("--hidden-dim", type=int, default=256,
                             help="Hidden layer dimension")
-    model_group.add_argument("--num-layers", type=int, default=1,
+    model_group.add_argument("--num-layers", type=int, default=16,
                             help="Number of recurrent layers")
     model_group.add_argument("--use-actor-critic", action="store_true", default=True,
                             help="Use combined actor-critic network")
     model_group.add_argument("--no-actor-critic", action="store_false", dest="use_actor_critic",
                             help="Use separate policy and value networks")
-    model_group.add_argument("--mlp-history", type=int, default=1,
-                            help="Observation history length for MLP")
     
     # Exploration
     explore_group = parser.add_argument_group("Exploration")
-    explore_group.add_argument("--std-init", type=float, default=0.5,
+    explore_group.add_argument("--std-init", type=float, default=0.2,
                               help="Initial policy std")
     explore_group.add_argument("--std-decay", type=float, default=0.9999,
                               help="Std decay factor per update")
@@ -1431,14 +1371,18 @@ def parse_args():
     
     # Reward shaping
     reward_group = parser.add_argument_group("Reward Shaping")
-    reward_group.add_argument("--shot-base-penalty", type=float, default=10.0,
+    reward_group.add_argument("--shot-base-penalty", type=float, default=1.0,
                              help="Base penalty for firing")
-    reward_group.add_argument("--shot-miss-penalty", type=float, default=20.0,
+    reward_group.add_argument("--shot-miss-penalty", type=float, default=30.0,
                              help="Miss penalty scale")
-    reward_group.add_argument("--align-bonus", type=float, default=25.0,
-                             help="Alignment bonus scale")
-    reward_group.add_argument("--align-penalty", type=float, default=600.0,
-                             help="Alignment penalty coefficient")
+    reward_group.add_argument("--miss-penalty", type=float, default=30.0,
+                             help="Static penalty per missed shot (should exceed hit reward)")
+    reward_group.add_argument("--hit-reward", type=float, default=20.0,
+                             help="Reward per hit")
+    reward_group.add_argument("--predicted-yaw-slope", type=float, default=100.0,
+                             help="Slope m for predicted yaw reward: r = m*(err - tolerance)")
+    reward_group.add_argument("--predicted-yaw-tolerance", type=float, default=1.0,
+                             help="Tolerance (deg) used as b in r = m*(err - tolerance)")
     
     # Evaluation
     eval_group = parser.add_argument_group("Evaluation")
@@ -1446,6 +1390,10 @@ def parse_args():
                            help="Evaluate every N iterations")
     eval_group.add_argument("--eval-episodes", type=int, default=50,
                            help="Episodes per evaluation")
+    eval_group.add_argument("--eval-deterministic", action="store_true", default=False,
+                           help="Use deterministic actions during evaluation")
+    eval_group.add_argument("--eval-stochastic", action="store_false", dest="eval_deterministic",
+                           help="Use stochastic actions during evaluation (matches rollouts)")
     
     # Checkpointing
     save_group = parser.add_argument_group("Checkpointing")
@@ -1505,7 +1453,6 @@ def load_checkpoint(
 def benchmark(
     n_envs: int = 1024,
     n_steps: int = 1000,
-    model_type: str = "gru",
     hidden_dim: int = 256,
 ):
     """
@@ -1515,7 +1462,7 @@ def benchmark(
     print(f"Benchmarking on {device}")
     print(f"  Environments: {n_envs}")
     print(f"  Steps: {n_steps}")
-    print(f"  Model: {model_type}")
+    print("  Model: gru")
     print()
     
     # Create environment
@@ -1626,6 +1573,11 @@ def main():
         batch_size=args.batch_size,
         n_epochs=args.n_epochs,
         learning_rate=args.lr,
+        adaptive_lr=args.adaptive_lr,
+        adaptive_lr_factor=args.adaptive_lr_factor,
+        adaptive_lr_patience=args.adaptive_lr_patience,
+        adaptive_lr_min_delta=args.adaptive_lr_min_delta,
+        adaptive_lr_max=args.adaptive_lr_max,
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
         # PPO
@@ -1635,11 +1587,9 @@ def main():
         max_grad_norm=args.max_grad_norm,
         target_kl=args.target_kl,
         # Model
-        model_type=args.model,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         use_actor_critic=args.use_actor_critic,
-        obs_history_k=args.mlp_history,
         # Exploration
         policy_std_init=args.std_init,
         policy_std_decay=args.std_decay,
@@ -1647,6 +1597,7 @@ def main():
         # Evaluation
         eval_interval=args.eval_interval,
         eval_episodes=args.eval_episodes,
+        eval_deterministic=args.eval_deterministic,
         # Checkpointing
         save_interval=args.save_interval,
         save_dir=args.save_dir,
@@ -1657,8 +1608,10 @@ def main():
         # Reward shaping
         shot_base_penalty=args.shot_base_penalty,
         shot_miss_penalty_scale=args.shot_miss_penalty,
-        align_bonus_scale=args.align_bonus,
-        align_penalty_coeff=args.align_penalty,
+        miss_penalty=args.miss_penalty,
+        hit_reward=args.hit_reward,
+        predicted_yaw_slope=args.predicted_yaw_slope,
+        predicted_yaw_tolerance_deg=args.predicted_yaw_tolerance,
     )
 
 
@@ -1673,14 +1626,12 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser()
         parser.add_argument("--n-envs", type=int, default=1024)
         parser.add_argument("--n-steps", type=int, default=1000)
-        parser.add_argument("--model", type=str, default="gru")
         parser.add_argument("--hidden-dim", type=int, default=256)
         args = parser.parse_args()
         
         benchmark(
             n_envs=args.n_envs,
             n_steps=args.n_steps,
-            model_type=args.model,
             hidden_dim=args.hidden_dim,
         )
     else:

@@ -22,6 +22,7 @@ class TurretEnv:
         self,
         dt: float = 0.015,
         max_steps: int = 500,
+        obs_history_k: int = 4,
         action_is_delta: bool = False,
         action_is_correction: bool = False,
         correction_baseline: str = "panel",
@@ -77,6 +78,11 @@ class TurretEnv:
         # Scaling constants for normalization
         self.max_distance = float(np.sqrt(WIDTH * WIDTH + HEIGHT * HEIGHT))
         self.speed_scale = 23000.0  # mm/s, rough scale for projectile speed
+        self.base_obs_dim = 4
+        self.obs_history_k = int(obs_history_k)
+        if self.obs_history_k < 1:
+            raise ValueError(f"obs_history_k must be >= 1, got {self.obs_history_k}")
+        self.obs_dim = self.base_obs_dim * self.obs_history_k
 
         self.sim: Simulator | None = None
         self.steps = 0
@@ -86,6 +92,7 @@ class TurretEnv:
         self._time_to_fire_remaining: float | None = None
         self._prev_d_theta = 0.0
         self._prev_d_pitch = 0.0
+        self._obs_history: np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # Core API
@@ -106,7 +113,15 @@ class TurretEnv:
         self._time_to_fire_remaining = None
         self._prev_d_theta = 0.0
         self._prev_d_pitch = 0.0
-        return self._get_obs()
+        self.last_reward_parts = {
+            "hit": 0.0,
+            "shot": 0.0,
+            "align": 0.0,
+            "track": 0.0,
+        }
+        obs_base = self._get_obs_base()
+        self._reset_history(obs_base)
+        return self._get_obs_from_history()
 
     def step(self, action: np.ndarray):
         """
@@ -134,16 +149,21 @@ class TurretEnv:
                 The timer then counts down by dt each step and fires when <= 0.
               - If maintain_fire_timer=False: this value is treated as
                 "time until firing relative to now" for *this step only*;
-                when <= 0 a projectile will be fired this step.
+                when <= dt a projectile will be fired this step.
         """
         if self.sim is None:
             raise RuntimeError("Call reset() before step().")
 
-        if action.shape[0] != 3:
-            raise ValueError("Action must have shape (3,), got %s" % (action.shape,))
+        if action.shape[0] not in (2, 3):
+            raise ValueError("Action must have shape (2,) or (3,), got %s" % (action.shape,))
 
         a0_raw = float(action[0])
-        a1_raw = float(action[1])
+        if action.shape[0] == 3:
+            a1_raw = float(action[1])
+            time_to_fire_cmd = float(action[2])
+        else:
+            a1_raw = 0.0
+            time_to_fire_cmd = float(action[1])
         a0 = a0_raw
         a1 = a1_raw
         if self.action_is_delta and self.action_is_correction:
@@ -160,19 +180,21 @@ class TurretEnv:
                 raw = self.sim.get_model_input()
                 baseline_yaw = float(raw[2])
                 baseline_pitch = float(raw[3])
+            elif self.correction_baseline == "ideal":
+                baseline_yaw = float(self.sim.ideal_yaw) if self.sim.ideal_yaw is not None else 0.0
+                baseline_pitch = float(self.sim.ideal_pitch) if self.sim.ideal_pitch is not None else 0.0
             else:
                 raise ValueError(
-                    "Unknown correction_baseline=%r (expected 'panel')." % (self.correction_baseline,)
+                    "Unknown correction_baseline=%r (expected 'panel' or 'ideal')." % (self.correction_baseline,)
                 )
             target_yaw = float(baseline_yaw + a0)
-            target_pitch = float(baseline_pitch + a1)
+            target_pitch = float(baseline_pitch)
         elif self.action_is_delta:
             target_yaw = float(self.sim.camera.theta + a0)
             target_pitch = float(self.sim.camera.pitch + a1)
         else:
             target_yaw = a0
             target_pitch = a1
-        time_to_fire_cmd = float(action[2])
 
         # Match real robot behavior: maintain a countdown timer internally.
         # This allows the policy to set a time-to-fire once and have it count down.
@@ -184,7 +206,7 @@ class TurretEnv:
             self._time_to_fire_remaining -= self.dt
             time_to_fire = self._time_to_fire_remaining
         else:
-            time_to_fire = time_to_fire_cmd
+            time_to_fire = time_to_fire_cmd - self.dt
 
         # Advance the simulator with model outputs
         shots_before = self.sim.shots_fired
@@ -195,7 +217,8 @@ class TurretEnv:
         self.steps += 1
 
         obs = self._get_obs()
-        reward = self._compute_reward()
+        reward, reward_parts = self._compute_reward()
+        self.last_reward_parts = reward_parts
         done = self._is_done()
         info = {
             "hit_count": self.sim.hit_count,
@@ -205,6 +228,7 @@ class TurretEnv:
             "target_yaw": float(target_yaw),
             "target_pitch": float(target_pitch),
             "last_shot_visible_panel_count": int(getattr(self.sim, "last_shot_visible_panel_count", 0) or 0),
+            "reward_parts": reward_parts,
         }
         if self.action_is_correction:
             info.update(
@@ -223,15 +247,12 @@ class TurretEnv:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _get_obs(self) -> np.ndarray:
+    def _get_obs_base(self) -> np.ndarray:
         """
-        Fetch and normalize the model input features from the simulator.
+        Fetch and normalize the base model input features from the simulator.
 
         Raw features from Simulator.get_model_input():
-          [camera_yaw,
-           camera_pitch,
-           yaw_to_panel,
-           pitch_to_panel,
+          [yaw_to_panel,
            panel_yaw_world,
            distance_to_panel_mm,
            projectile_speed_mm_per_s]
@@ -243,30 +264,49 @@ class TurretEnv:
         """
         raw = self.sim.get_model_input()
 
-        camera_yaw = raw[0] / np.pi
-        camera_pitch = raw[1] / np.pi
-        yaw_to_panel = raw[2] / np.pi
-        pitch_to_panel = raw[3] / np.pi
-        panel_yaw_world = raw[4] / np.pi
+        yaw_to_panel = raw[0] / np.pi
+        panel_yaw_world = raw[1] / np.pi
 
-        distance = raw[5] / max(self.max_distance, 1e-6)
-        projectile_speed = raw[6] / self.speed_scale
+        distance = raw[2] / max(self.max_distance, 1e-6)
+        projectile_speed = raw[3] / self.speed_scale
 
-        obs = np.array(
+        return np.array(
             [
-                camera_yaw,
-                camera_pitch,
                 yaw_to_panel,
-                pitch_to_panel,
                 panel_yaw_world,
                 distance,
                 projectile_speed,
             ],
             dtype=np.float32,
         )
-        return obs
 
-    def _compute_reward(self) -> float:
+    def _reset_history(self, obs_base: np.ndarray) -> None:
+        obs_base = np.asarray(obs_base, dtype=np.float32)
+        obs_repeat = np.repeat(obs_base[None, :], self.obs_history_k, axis=0)
+        self._obs_history = obs_repeat
+
+    def _update_history(self, obs_base: np.ndarray) -> None:
+        obs_base = np.asarray(obs_base, dtype=np.float32)
+        if self._obs_history is None or self._obs_history.shape != (self.obs_history_k, self.base_obs_dim):
+            self._reset_history(obs_base)
+            return
+        if self.obs_history_k == 1:
+            self._obs_history[0] = obs_base
+            return
+        self._obs_history[:-1] = self._obs_history[1:]
+        self._obs_history[-1] = obs_base
+
+    def _get_obs_from_history(self) -> np.ndarray:
+        if self._obs_history is None:
+            return self._get_obs_base()
+        return self._obs_history.reshape(-1).astype(np.float32, copy=False)
+
+    def _get_obs(self) -> np.ndarray:
+        obs_base = self._get_obs_base()
+        self._update_history(obs_base)
+        return self._get_obs_from_history()
+
+    def _compute_reward(self):
         """
         Combine hit-based reward with alignment-based shaping.
         """
@@ -366,16 +406,22 @@ class TurretEnv:
         self._prev_d_theta = d_theta
         self._prev_d_pitch = d_pitch
 
-        return float(
+        r_shot = float(r_shot_base + r_shot_miss + r_blind_fire)
+        reward_parts = {
+            "hit": float(r_hit),
+            "shot": r_shot,
+            "align": float(r_align),
+            "track": float(r_track),
+        }
+        total_reward = float(
             r_hit
-            + r_shot_base
-            + r_shot_miss
-            + r_blind_fire
+            + r_shot
             + r_align
             + r_track
             + r_motion
             + r_jerk
         )
+        return total_reward, reward_parts
 
     def _is_done(self) -> bool:
         """Episode termination condition."""

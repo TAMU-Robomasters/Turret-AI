@@ -1,12 +1,12 @@
+import argparse
+import os
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import argparse
 from collections import deque
 import turret_sim
 from turret_env import TurretEnv
-from new_model_type import PolicyPINT
 
 
 class PolicyGRU(nn.Module):
@@ -15,12 +15,13 @@ class PolicyGRU(nn.Module):
         obs_dim: int,
         hidden_dim: int,
         action_dim: int,
+        num_layers: int = 1,
         action_low=None,
         action_high=None,
     ):
         super().__init__()
         self.obs_embed = nn.Linear(obs_dim, hidden_dim)
-        self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+        self.gru = nn.GRU(hidden_dim, hidden_dim, num_layers=int(num_layers), batch_first=True)
         self.mu = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
         if action_low is None:
@@ -75,155 +76,68 @@ class PolicyGRU(nn.Module):
         return self._squash_to_action_space(mu), h
 
 
-class PolicyLSTM(nn.Module):
-    def __init__(
-        self,
-        obs_dim: int,
-        hidden_dim: int,
-        action_dim: int,
-        action_low=None,
-        action_high=None,
-    ):
+
+class ValueGRU(nn.Module):
+    def __init__(self, obs_dim: int, hidden_dim: int, num_layers: int = 1):
         super().__init__()
         self.obs_embed = nn.Linear(obs_dim, hidden_dim)
-        self.lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
-        self.mu = nn.Linear(hidden_dim, action_dim)
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
-        if action_low is None:
-            action_low = [-np.pi, -np.pi / 3.0, 0.0]
-        if action_high is None:
-            action_high = [np.pi, np.pi / 3.0, 1.0]
-        self._action_low_np = np.asarray(action_low, dtype=np.float32)
-        self._action_high_np = np.asarray(action_high, dtype=np.float32)
+        self.gru = nn.GRU(hidden_dim, hidden_dim, num_layers=int(num_layers), batch_first=True)
+        self.value_head = nn.Linear(hidden_dim, 1)
 
-    def _action_low(self, device):
-        return torch.as_tensor(self._action_low_np, dtype=torch.float32, device=device)
+    def forward(self, obs_seq: torch.Tensor, hidden: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        obs_seq: (T, obs_dim) or (B, T, obs_dim)
+        returns: (T,) or (B, T)
+        """
+        squeeze_output = False
+        if obs_seq.dim() == 2:
+            obs_seq = obs_seq.unsqueeze(0)
+            squeeze_output = True
 
-    def _action_high(self, device):
-        return torch.as_tensor(self._action_high_np, dtype=torch.float32, device=device)
-
-    def _squash_to_action_space(self, raw_action):
-        low = self._action_low(raw_action.device)
-        high = self._action_high(raw_action.device)
-        action01 = 0.5 * (torch.tanh(raw_action) + 1.0)
-        return low + (high - low) * action01
-
-    def forward(self, obs_seq, hidden=None):
         x = torch.relu(self.obs_embed(obs_seq))
-        out, h = self.lstm(x, hidden)
-        mu = self.mu(out)
-        return mu, self.log_std.exp(), h
-
-    def sample_action(self, obs_seq, hidden=None):
-        mu, std, h = self.forward(obs_seq, hidden)
-        dist = torch.distributions.Normal(mu, std)
-        raw_action = dist.sample()
-        action = self._squash_to_action_space(raw_action)
-
-        log_det_jacobian = 2.0 * (
-            np.log(2.0) - raw_action - torch.nn.functional.softplus(-2.0 * raw_action)
-        )
-        log_prob = dist.log_prob(raw_action).sum(-1) - log_det_jacobian.sum(-1)
-        return action, log_prob, h
-
-    def mean_action(self, obs_seq, hidden=None):
-        mu, _, h = self.forward(obs_seq, hidden)
-        return self._squash_to_action_space(mu), h
+        out, _ = self.gru(x, hidden)
+        values = self.value_head(out).squeeze(-1)
+        if squeeze_output:
+            values = values.squeeze(0)
+        return values
 
 
-class PolicyMLP(nn.Module):
-    """
-    Simple feed-forward policy.
+class TrainingLogger:
+    """CSV logger for plotting training curves."""
 
-    Uses the last timestep from obs_seq (shape BxTxObs). In your current
-    training loop T is effectively 1, but this keeps the API compatible
-    with the recurrent models.
-    """
+    def __init__(self, log_dir: str | None = "checkpoints"):
+        self.log_dir = log_dir
+        self.log_file = None
+        self._header_written = False
+        if log_dir is not None:
+            os.makedirs(log_dir, exist_ok=True)
+            self.log_file = open(os.path.join(log_dir, "training.log"), "w")
 
-    def __init__(
-        self,
-        obs_dim: int,
-        hidden_dim: int,
-        action_dim: int,
-        action_low=None,
-        action_high=None,
-        obs_history_k: int = 1,
-    ):
-        super().__init__()
-        self.obs_dim = int(obs_dim)
-        self.hidden_dim = int(hidden_dim)
-        self.action_dim = int(action_dim)
-        self.obs_history_k = int(obs_history_k)
+    def _write_header(self, columns: list[str]) -> None:
+        if self.log_file is None or self._header_written:
+            return
+        self.log_file.write(",".join(columns) + "\n")
+        self.log_file.flush()
+        self._header_written = True
 
-        self.mlp = nn.Sequential(
-            nn.Linear(self.obs_dim, self.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.ReLU(),
-        )
-        self.mu = nn.Linear(self.hidden_dim, self.action_dim)
-        self.log_std = nn.Parameter(torch.zeros(self.action_dim))
+    def write_row(self, row: dict) -> None:
+        if self.log_file is None:
+            return
+        columns = list(row.keys())
+        self._write_header(columns)
+        values = []
+        for key in columns:
+            val = row.get(key, "")
+            if isinstance(val, float):
+                values.append(f"{val:.6f}")
+            else:
+                values.append(str(val))
+        self.log_file.write(",".join(values) + "\n")
+        self.log_file.flush()
 
-        if action_low is None:
-            action_low = [-np.pi, -np.pi / 3.0, 0.0]
-        if action_high is None:
-            action_high = [np.pi, np.pi / 3.0, 1.0]
-        self._action_low_np = np.asarray(action_low, dtype=np.float32)
-        self._action_high_np = np.asarray(action_high, dtype=np.float32)
-
-    def _action_low(self, device):
-        return torch.as_tensor(self._action_low_np, dtype=torch.float32, device=device)
-
-    def _action_high(self, device):
-        return torch.as_tensor(self._action_high_np, dtype=torch.float32, device=device)
-
-    def _squash_to_action_space(self, raw_action):
-        low = self._action_low(raw_action.device)
-        high = self._action_high(raw_action.device)
-        action01 = 0.5 * (torch.tanh(raw_action) + 1.0)
-        return low + (high - low) * action01
-
-    def forward(self, obs_seq, hidden=None):
-        if obs_seq.dim() != 3:
-            raise ValueError(f"obs_seq must have shape (B,T,Obs), got {tuple(obs_seq.shape)}")
-
-        x_last = obs_seq[:, -1, :]
-        x = self.mlp(x_last)
-        mu = self.mu(x).unsqueeze(1)  # keep time dimension for API parity
-        return mu, self.log_std.exp(), None
-
-    def sample_action(self, obs_seq, hidden=None):
-        mu, std, _ = self.forward(obs_seq, hidden)
-        dist = torch.distributions.Normal(mu, std)
-        raw_action = dist.sample()
-        action = self._squash_to_action_space(raw_action)
-
-        log_det_jacobian = 2.0 * (
-            np.log(2.0) - raw_action - torch.nn.functional.softplus(-2.0 * raw_action)
-        )
-        log_prob = dist.log_prob(raw_action).sum(-1) - log_det_jacobian.sum(-1)
-        return action, log_prob.squeeze(1) if log_prob.dim() == 3 else log_prob, None
-
-    def mean_action(self, obs_seq, hidden=None):
-        mu, _, _ = self.forward(obs_seq, hidden)
-        # forward() keeps time dimension, so squeeze back to match others.
-        action = self._squash_to_action_space(mu)
-        return action, None
-
-
-class ValueMLP(nn.Module):
-    def __init__(self, obs_dim: int, hidden_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, obs_batch: torch.Tensor) -> torch.Tensor:
-        return self.net(obs_batch).squeeze(-1)
+    def close(self) -> None:
+        if self.log_file is not None:
+            self.log_file.close()
 
 
 def _raw_action_from_squashed(policy: nn.Module, action: torch.Tensor) -> torch.Tensor:
@@ -280,6 +194,12 @@ def collect_episode(
     act_buf = []
     logprob_buf = []
     reward_buf = []
+    reward_parts_sum = {
+        "hit": 0.0,
+        "shot": 0.0,
+        "align": 0.0,
+        "track": 0.0,
+    }
 
     k = int(getattr(policy, "obs_history_k", 1) or 1)
     obs_np = env.reset(seed=reset_seed)
@@ -300,7 +220,11 @@ def collect_episode(
         # `action` tracks gradients for policy optimization; env stepping should not.
         action_np = action.squeeze(0).squeeze(0).detach().cpu().numpy()
 
-        obs_next, reward, done, _ = env.step(action_np)
+        obs_next, reward, done, info = env.step(action_np)
+        if isinstance(info, dict) and "reward_parts" in info:
+            for part_key, part_val in info["reward_parts"].items():
+                if part_key in reward_parts_sum:
+                    reward_parts_sum[part_key] += float(part_val)
 
         if k > 1:
             obs_hist.pop(0)
@@ -327,6 +251,7 @@ def collect_episode(
         "logprob": torch.stack(logprob_buf, dim=0).view(-1),
         "reward": torch.as_tensor(reward_buf, dtype=torch.float32, device=device),
         "terminal": bool(done),
+        "reward_parts": reward_parts_sum,
     }
 
     return traj
@@ -409,11 +334,6 @@ def train(
     seed: int | None = None,
     eval_seed: int | None = 12345,
     save_current_every: int = 10,
-    model: str = "gru",
-    pint_layers: int = 2,
-    pint_heads: int = 4,
-    pint_context: int = 32,
-    pint_dropout: float = 0.1,
     shot_base_penalty: float = 10.0,
     shot_miss_penalty_scale: float = 20.0,
     shot_miss_target_radius_mm: float = 60.0,
@@ -421,7 +341,7 @@ def train(
     shot_miss_max_ratio: float = 5.0,
     shot_miss_max_angle_deg: float = 45.0,
     hidden_dim: int = 256,
-    mlp_k: int = 8,
+    num_layers: int = 1,
     debug_interval: int = 10,
     debug_window: int = 50,
     policy_std_decay: float = 0.9995,
@@ -433,6 +353,7 @@ def train(
     ppo_clip_coef: float = 0.2,
     ppo_value_coef: float = 0.5,
     ppo_entropy_coef: float = 0.01,
+    log_dir: str = "checkpoints",
 ):
     # Disable simulator debug visuals/logs during training.
     # This does not affect the training progress prints in this file.
@@ -452,12 +373,15 @@ def train(
         seed=seed,
     )
 
-    base_obs_dim = 7
+    base_obs_dim = 4
     action_dim = 3
     hidden_dim = int(hidden_dim)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required but not available. Check your NVIDIA driver/CUDA setup.")
+    device = torch.device("cuda")
     print(device)
+    logger = TrainingLogger(log_dir=log_dir)
 
     # In correction mode, actions are per-step corrections, not absolute yaw/pitch.
     # Keep their range modest; large ranges let the policy "learn" ~pi (180°) flips.
@@ -466,59 +390,18 @@ def train(
     action_low = [-correction_yaw_max, -correction_pitch_max, 0.0]
     action_high = [correction_yaw_max, correction_pitch_max, 1.0]
 
-    model = str(model).lower().strip()
     algo = str(algo).lower().strip()
     obs_dim = base_obs_dim
-    mlp_k = int(mlp_k)
-    if model == "mlp":
-        obs_dim = base_obs_dim * mlp_k
-    if model == "gru":
-        policy = PolicyGRU(
-            obs_dim,
-            hidden_dim,
-            action_dim,
-            action_low=action_low,
-            action_high=action_high,
-        ).to(device)
-        best_model_path = "best_policy_gru.pt"
-        current_model_path = "current_gru.pt"
-    elif model == "lstm":
-        policy = PolicyLSTM(
-            obs_dim,
-            hidden_dim,
-            action_dim,
-            action_low=action_low,
-            action_high=action_high,
-        ).to(device)
-        best_model_path = "best_policy_lstm.pt"
-        current_model_path = "current_lstm.pt"
-    elif model == "mlp":
-        policy = PolicyMLP(
-            obs_dim,
-            hidden_dim,
-            action_dim,
-            action_low=action_low,
-            action_high=action_high,
-            obs_history_k=mlp_k,
-        ).to(device)
-        best_model_path = "best_policy_mlp.pt"
-        current_model_path = "current_mlp.pt"
-    elif model == "pint":
-        policy = PolicyPINT(
-            obs_dim,
-            hidden_dim,
-            action_dim,
-            n_layers=int(pint_layers),
-            n_heads=int(pint_heads),
-            context_len=int(pint_context),
-            dropout=float(pint_dropout),
-            action_low=action_low,
-            action_high=action_high,
-        ).to(device)
-        best_model_path = "best_policy_pint.pt"
-        current_model_path = "current_pint.pt"
-    else:
-        raise ValueError("Unknown --model %r (expected 'gru', 'lstm', 'mlp', or 'pint')." % (model,))
+    policy = PolicyGRU(
+        obs_dim,
+        hidden_dim,
+        action_dim,
+        num_layers=int(num_layers),
+        action_low=action_low,
+        action_high=action_high,
+    ).to(device)
+    best_model_path = "best_policy_gru.pt"
+    current_model_path = "current_gru.pt"
 
     if seed is not None:
         np.random.seed(seed)
@@ -528,7 +411,7 @@ def train(
     value_net = None
     value_optimizer = None
     if algo == "ppo":
-        value_net = ValueMLP(obs_dim=obs_dim, hidden_dim=hidden_dim).to(device)
+        value_net = ValueGRU(obs_dim=obs_dim, hidden_dim=hidden_dim, num_layers=int(num_layers)).to(device)
         value_optimizer = optim.Adam(value_net.parameters(), lr=float(lr))
     elif algo != "reinforce":
         raise ValueError("Unknown --algo %r (expected 'reinforce' or 'ppo')." % (algo,))
@@ -676,11 +559,51 @@ def train(
             policy_std = float(policy.log_std.detach().exp().mean().item())
             eval_avg = float(np.mean(recent_eval)) if recent_eval else float("nan")
             eval_part = f", EvalAvg({len(recent_eval)})={eval_avg:.1f}" if recent_eval else ""
-            print(
+            msg = (
                 f"Episode {episode}, Return={total_return:.1f}, Len={ep_len}, "
                 f"AvgReturn({len(recent_returns)})={avg_return:.1f}, AvgLen({len(recent_lengths)})={avg_len:.1f}, "
                 f"AvgLoss({len(recent_losses)})={avg_loss:.4f}, GradNorm={grad_norm:.3f}, Algo={algo}, "
                 f"PolicyStd={policy_std:.3f}, BestEval={best_return:.1f}{eval_part}"
+            )
+            print(msg)
+            logger.write_row(
+                {
+                    "type": "train",
+                    "episode": episode,
+                    "return": total_return,
+                    "length": ep_len,
+                    "avg_return": avg_return,
+                    "avg_length": avg_len,
+                    "avg_loss": avg_loss,
+                    "grad_norm": grad_norm,
+                    "policy_std": policy_std,
+                    "best_eval": best_return,
+                    "eval_avg": eval_avg,
+                    "hit": float(traj["reward_parts"]["hit"]),
+                    "shot": float(traj["reward_parts"]["shot"]),
+                    "align": float(traj["reward_parts"]["align"]),
+                    "track": float(traj["reward_parts"]["track"]),
+                }
+            )
+        if episode % 10 == 0:
+            rp = traj["reward_parts"]
+            msg = (
+                f"ep={episode} ret={total_return:.1f} len={len(traj['reward'])} "
+                f"hit={rp['hit']:.1f} shot={rp['shot']:.1f} "
+                f"align={rp['align']:.1f} track={rp['track']:.1f}"
+            )
+            print(msg)
+            logger.write_row(
+                {
+                    "type": "reward_parts",
+                    "episode": episode,
+                    "return": total_return,
+                    "length": ep_len,
+                    "hit": float(rp["hit"]),
+                    "shot": float(rp["shot"]),
+                    "align": float(rp["align"]),
+                    "track": float(rp["track"]),
+                }
             )
 
         if episode % eval_interval == 0:
@@ -693,8 +616,14 @@ def train(
                 base_seed=None if eval_seed is None else int(eval_seed),
             )
 
-            print(
-                f"Evaluation after {episode} episodes -> Mean Return: {eval_return:.2f}"
+            eval_msg = f"Evaluation after {episode} episodes -> Mean Return: {eval_return:.2f}"
+            print(eval_msg)
+            logger.write_row(
+                {
+                    "type": "eval",
+                    "episode": episode,
+                    "eval_return": eval_return,
+                }
             )
             recent_eval.append(float(eval_return))
 
@@ -706,21 +635,47 @@ def train(
 
                 torch.save(policy.state_dict(), best_model_path)
 
-                print(
-                    f"New best model! Eval Return={eval_return:.2f}"
+                msg = f"New best model! Eval Return={eval_return:.2f}"
+                print(msg)
+                logger.write_row(
+                    {
+                        "type": "eval_best",
+                        "episode": episode,
+                        "eval_return": eval_return,
+                    }
                 )
             else:
                 eval_no_improve += 1
-                print(
+                msg = (
                     f"No eval improvement for {eval_no_improve}/{int(eval_patience)} checks "
                     f"(best={best_return:.2f}, current={eval_return:.2f})"
                 )
+                print(msg)
+                logger.write_row(
+                    {
+                        "type": "eval_no_improve",
+                        "episode": episode,
+                        "eval_return": eval_return,
+                        "best_eval": best_return,
+                        "no_improve": eval_no_improve,
+                    }
+                )
                 if int(eval_patience) > 0 and eval_no_improve >= int(eval_patience):
-                    print(
+                    msg = (
                         "Early stopping: eval has not improved for "
                         f"{int(eval_patience)} checks (min_delta={float(eval_min_delta):.2f})."
                     )
+                    print(msg)
+                    logger.write_row(
+                        {
+                            "type": "early_stop",
+                            "episode": episode,
+                            "best_eval": best_return,
+                            "no_improve": eval_no_improve,
+                        }
+                    )
                     break
+    logger.close()
 
 
 if __name__ == "__main__":
@@ -734,19 +689,14 @@ if __name__ == "__main__":
     parser.add_argument("--eval-seed", type=int, default=12345)
     parser.add_argument("--save-current-every", type=int, default=10)
     parser.add_argument("--algo", type=str, default="ppo", choices=["reinforce", "ppo"])
-    parser.add_argument("--model", type=str, default="gru", choices=["gru", "lstm", "mlp", "pint"])
-    parser.add_argument("--pint-layers", type=int, default=2)
-    parser.add_argument("--pint-heads", type=int, default=4)
-    parser.add_argument("--pint-context", type=int, default=32)
-    parser.add_argument("--pint-dropout", type=float, default=0.1)
     parser.add_argument("--shot-base-penalty", type=float, default=10.0)
     parser.add_argument("--shot-miss-penalty-scale", type=float, default=20.0)
     parser.add_argument("--shot-miss-target-radius-mm", type=float, default=60.0)
     parser.add_argument("--shot-miss-penalty-power", type=float, default=1.0)
     parser.add_argument("--shot-miss-max-ratio", type=float, default=5.0)
-    parser.add_argument("--shot-miss-max-angle-deg", type=float, default=45.0)
-    parser.add_argument("--hidden-dim", type=int, default=256)
-    parser.add_argument("--mlp-k", type=int, default=8)
+    parser.add_argument("--shot-miss-max-angle-deg", type=float, default=1.0)
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--num-layers", type=int, default=8)
     parser.add_argument("--debug-interval", type=int, default=10)
     parser.add_argument("--debug-window", type=int, default=50)
     parser.add_argument("--policy-std-decay", type=float, default=0.9995)
@@ -757,6 +707,7 @@ if __name__ == "__main__":
     parser.add_argument("--ppo-clip-coef", type=float, default=0.2)
     parser.add_argument("--ppo-value-coef", type=float, default=0.5)
     parser.add_argument("--ppo-entropy-coef", type=float, default=0.01)
+    parser.add_argument("--log-dir", type=str, default="checkpoints")
     args = parser.parse_args()
 
     train(
@@ -769,11 +720,6 @@ if __name__ == "__main__":
         eval_seed=args.eval_seed,
         save_current_every=args.save_current_every,
         algo=args.algo,
-        model=args.model,
-        pint_layers=args.pint_layers,
-        pint_heads=args.pint_heads,
-        pint_context=args.pint_context,
-        pint_dropout=args.pint_dropout,
         shot_base_penalty=args.shot_base_penalty,
         shot_miss_penalty_scale=args.shot_miss_penalty_scale,
         shot_miss_target_radius_mm=args.shot_miss_target_radius_mm,
@@ -781,7 +727,7 @@ if __name__ == "__main__":
         shot_miss_max_ratio=args.shot_miss_max_ratio,
         shot_miss_max_angle_deg=args.shot_miss_max_angle_deg,
         hidden_dim=args.hidden_dim,
-        mlp_k=args.mlp_k,
+        num_layers=args.num_layers,
         debug_interval=args.debug_interval,
         debug_window=args.debug_window,
         policy_std_decay=args.policy_std_decay,
@@ -792,4 +738,5 @@ if __name__ == "__main__":
         ppo_clip_coef=args.ppo_clip_coef,
         ppo_value_coef=args.ppo_value_coef,
         ppo_entropy_coef=args.ppo_entropy_coef,
+        log_dir=args.log_dir,
     )

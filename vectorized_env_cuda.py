@@ -19,7 +19,7 @@ class VectorizedTurretEnv:
     
     API:
         obs = env.reset()                    # (N, obs_dim)
-        obs, reward, done, info = env.step(actions)  # actions: (N, 3)
+        obs, reward, done, info = env.step(actions)  # actions: (N, 2) or (N, 3)
     """
     
     def __init__(
@@ -28,6 +28,7 @@ class VectorizedTurretEnv:
         device: torch.device,
         dt: float = 0.015,
         max_steps: int = 500,
+        obs_history_k: int = 4,
         # Action mode
         action_is_correction: bool = True,
         correction_baseline: str = "panel",
@@ -42,27 +43,32 @@ class VectorizedTurretEnv:
         lost_penalty_cap_steps: int = 50,
         lost_terminal_penalty: float = -5000.0,
         # Shot penalties
-        shot_base_penalty: float = 10.0,
-        shot_miss_penalty_scale: float = 20.0,
+        shot_base_penalty: float = 0.0,
+        shot_miss_penalty_scale: float = 0.0,
         shot_miss_target_radius_mm: float = 60.0,
         shot_miss_penalty_power: float = 1.0,
         shot_miss_max_ratio: float = 5.0,
         shot_miss_max_angle_deg: float = 45.0,
-        # Alignment rewards
-        align_bonus_scale: float = 25.0,
-        align_penalty_coeff: float = 600.0,
-        align_penalty_power: float = 1.0,
-        align_angle_scale_deg: float = 45.0,
+        # Predicted-yaw reward (mx + b)
+        predicted_yaw_slope: float = 10.0,
+        predicted_yaw_tolerance_deg: float = 2.0,
+        # Miss penalty (static per missed shot)
+        miss_penalty: float = 150.0,
         # Tracking reward
-        track_visible_reward: float = 50.0,
+        track_visible_reward: float = 0.0,
         # Motion penalties
-        motion_penalty_coeff: float = 50.0,
-        jerk_penalty_coeff: float = 200.0,
+        motion_penalty_coeff: float = 0.0,
+        jerk_penalty_coeff: float = 5.0,
         # Hit reward
-        hit_reward: float = 110.0,
-        blind_fire_penalty: float = -500.0,
+        hit_reward: float = 200.0,
+        blind_fire_penalty: float = -200.0,
         # Dtype
         dtype: torch.dtype = torch.float32,
+        # Spin behavior
+        spin_mode: str = "constant",
+        spin_rate: float = 9.0,
+        spin_rate_std: float = 4.0,
+        spin_noise_std: float = 0.02,
     ):
         self.n_envs = n_envs
         self.device = device
@@ -91,10 +97,10 @@ class VectorizedTurretEnv:
         self.shot_miss_max_ratio = shot_miss_max_ratio
         self.shot_miss_max_angle_deg = math.radians(shot_miss_max_angle_deg)
         
-        self.align_bonus_scale = align_bonus_scale
-        self.align_penalty_coeff = align_penalty_coeff
-        self.align_penalty_power = align_penalty_power
-        self.align_angle_scale_rad = math.radians(align_angle_scale_deg)
+        # Linear slope for predicted yaw reward: r = m*(err - tolerance)
+        self.predicted_yaw_slope = predicted_yaw_slope
+        self.predicted_yaw_tolerance_rad = math.radians(predicted_yaw_tolerance_deg)
+        self.miss_penalty = miss_penalty
         
         self.track_visible_reward = track_visible_reward
         self.motion_penalty_coeff = motion_penalty_coeff
@@ -106,14 +112,22 @@ class VectorizedTurretEnv:
         self.max_distance = math.sqrt(WIDTH * WIDTH + HEIGHT * HEIGHT)
         self.speed_scale = 23000.0
         
-        # Observation dimension
-        self.obs_dim = 7
+        # Observation dimension (yaw-only features)
+        self.base_obs_dim = 4
+        self.obs_history_k = int(obs_history_k)
+        if self.obs_history_k < 1:
+            raise ValueError(f"obs_history_k must be >= 1, got {self.obs_history_k}")
+        self.obs_dim = self.base_obs_dim * self.obs_history_k
         
         # Create simulator
         self.sim = VectorizedSimulator(
             n_envs=n_envs,
             device=device,
             dtype=dtype,
+            spin_mode=spin_mode,
+            spin_rate=spin_rate,
+            spin_rate_std=spin_rate_std,
+            spin_noise_std=spin_noise_std,
         )
         
         # Environment state tracking (N,)
@@ -134,6 +148,11 @@ class VectorizedTurretEnv:
         
         # dt tensor
         self._dt_tensor = torch.full((n_envs,), dt, device=device, dtype=dtype)
+
+        # Observation history buffer: (N, K, base_obs_dim)
+        self.obs_history = torch.zeros(
+            n_envs, self.obs_history_k, self.base_obs_dim, device=device, dtype=dtype
+        )
 
     def reset(
         self, 
@@ -169,29 +188,47 @@ class VectorizedTurretEnv:
         self.prev_d_theta[env_mask] = 0.0
         self.prev_d_pitch[env_mask] = 0.0
         
+        obs_base = self._get_obs_base()
+        self._reset_history(obs_base, env_mask)
         return self._get_obs()
 
+    def _get_obs_base(self) -> torch.Tensor:
+        """Get normalized base observations from simulator."""
+        return self.sim.get_model_input()  # Already normalized (N, 4)
+
+    def _reset_history(self, obs_base: torch.Tensor, env_mask: torch.Tensor) -> None:
+        """Reset history for selected envs using the current obs."""
+        if env_mask is None:
+            env_mask = torch.ones(self.n_envs, device=self.device, dtype=torch.bool)
+        if env_mask.any():
+            obs_repeat = obs_base[env_mask].unsqueeze(1).repeat(1, self.obs_history_k, 1)
+            self.obs_history[env_mask] = obs_repeat
+
+    def _update_history(self, obs_base: torch.Tensor) -> None:
+        """Append current obs to history for all envs."""
+        if self.obs_history_k == 1:
+            self.obs_history[:, 0, :] = obs_base
+            return
+        self.obs_history = torch.roll(self.obs_history, shifts=-1, dims=1)
+        self.obs_history[:, -1, :] = obs_base
+
     def _get_obs(self) -> torch.Tensor:
-        """Get normalized observations from simulator."""
-        return self.sim.get_model_input()  # Already normalized (N, 7)
+        """Return stacked observation history (oldest -> newest)."""
+        return self.obs_history.reshape(self.n_envs, -1)
 
     def _get_baseline_aim(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Get baseline aim direction (yaw, pitch) to target panel.
-        
+        Get baseline aim direction (yaw, pitch) to predicted line (ideal lead).
+
         Returns:
             baseline_yaw: (N,)
             baseline_pitch: (N,)
         """
-        # Get raw model input which contains yaw_to_panel and pitch_to_panel
-        raw_obs = self.sim.get_model_input()
-        
-        # Denormalize (features are divided by pi)
-        baseline_yaw = raw_obs[:, 2] * math.pi    # yaw_to_panel
-        baseline_pitch = raw_obs[:, 3] * math.pi  # pitch_to_panel
-        
-        return baseline_yaw, baseline_pitch
+        # Use predicted line (ideal lead) from simulator
+        baseline_yaw = self.sim.ideal_yaw
+        baseline_pitch = self.sim.ideal_pitch
 
+        return baseline_yaw, baseline_pitch
     def step(
         self, 
         actions: torch.Tensor,
@@ -200,10 +237,11 @@ class VectorizedTurretEnv:
         Step all environments with given actions.
         
         Args:
-            actions: (N, 3) tensor
+            actions: (N, 2) or (N, 3) tensor
                 - actions[:, 0]: yaw correction/delta/absolute
-                - actions[:, 1]: pitch correction/delta/absolute  
-                - actions[:, 2]: time_to_fire command
+                - actions[:, 1]: time_to_fire command (if shape is (N, 2))
+                - actions[:, 1]: pitch correction/delta/absolute (if shape is (N, 3), ignored)
+                - actions[:, 2]: time_to_fire command (if shape is (N, 3))
                 
         Returns:
             obs: (N, obs_dim) observations
@@ -213,25 +251,30 @@ class VectorizedTurretEnv:
         """
         actions = actions.to(device=self.device, dtype=self.dtype)
         
-        if actions.shape != (self.n_envs, 3):
-            raise ValueError(f"Expected actions shape ({self.n_envs}, 3), got {actions.shape}")
+        if actions.shape not in {(self.n_envs, 3), (self.n_envs, 2)}:
+            raise ValueError(
+                f"Expected actions shape ({self.n_envs}, 3) or ({self.n_envs}, 2), got {actions.shape}"
+            )
         
         # === Parse Actions ===
         a0_raw = actions[:, 0]  # yaw
-        a1_raw = actions[:, 1]  # pitch
-        time_to_fire_cmd = actions[:, 2]
+        if actions.shape[1] == 3:
+            a1_raw = actions[:, 1]  # pitch (ignored for yaw-only control)
+            time_to_fire_cmd = actions[:, 2]
+        else:
+            a1_raw = torch.zeros_like(a0_raw)
+            time_to_fire_cmd = actions[:, 1]
         
         # === Compute Target Yaw/Pitch ===
         if self.action_is_correction:
-            # Clip corrections
+            # Clip corrections (yaw only)
             a0 = torch.clamp(a0_raw, -self.correction_clip_yaw, self.correction_clip_yaw)
-            a1 = torch.clamp(a1_raw, -self.correction_clip_pitch, self.correction_clip_pitch)
-            
-            # Get baseline
+
+            # Get baseline (gravity-compensated ideal lead)
             baseline_yaw, baseline_pitch = self._get_baseline_aim()
-            
+
             target_yaw = baseline_yaw + a0
-            target_pitch = baseline_pitch + a1
+            target_pitch = baseline_pitch
         else:
             # Absolute or delta mode
             target_yaw = a0_raw
@@ -254,7 +297,8 @@ class VectorizedTurretEnv:
             # Determine firing
             fire_mask = self.time_to_fire_remaining <= 0.0
         else:
-            fire_mask = time_to_fire_cmd <= 0.0
+            # Interpret as time-until-fire this step; fire if within this step.
+            fire_mask = time_to_fire_cmd <= self.dt
         
         # === Convert to Deltas ===
         d_theta = self._angle_diff(target_yaw, self.sim.camera_theta)
@@ -298,6 +342,8 @@ class VectorizedTurretEnv:
         dones = self._compute_dones(step_info)
         
         # === Get Observations ===
+        obs_base = self._get_obs_base()
+        self._update_history(obs_base)
         obs = self._get_obs()
         
         # === Build Info Dict ===
@@ -328,129 +374,46 @@ class VectorizedTurretEnv:
     ) -> torch.Tensor:
         """
         Compute rewards for all environments (vectorized).
-        
-        Returns:
-            rewards: (N,) tensor
+
+        Simplified reward: predicted-line tracking + hit reward + miss penalty.
         """
         device = self.device
         dtype = self.dtype
         N = self.n_envs
-        
+
         # === Hit Reward ===
         hit_inc = (self.sim.hit_count - prev_hit_count).to(dtype)
         r_hit = self.hit_reward * hit_inc
-        
-        # === Shot Penalties ===
+
+        # === Miss Penalty (static per missed shot) ===
         shots_inc = (self.sim.shots_fired - prev_shots_fired).to(dtype)
-        r_shot_base = -self.shot_base_penalty * shots_inc
-        
-        # === Miss Penalty (based on aim error at fire time) ===
         r_shot_miss = torch.zeros(N, device=device, dtype=dtype)
-        r_blind_fire = torch.zeros(N, device=device, dtype=dtype)
-        
-        fired = shots_inc > 0
-        if fired.any():
-            # Check blind fire (no visible panels)
-            visible_count = self.sim.last_shot_visible_count.to(dtype)
-            blind = fired & (visible_count <= 0)
-            r_blind_fire = torch.where(
-                blind,
-                torch.full((N,), self.blind_fire_penalty, device=device, dtype=dtype) * shots_inc,
-                r_blind_fire
-            )
-            
-            # Miss penalty for non-blind shots
-            not_blind = fired & (visible_count > 0)
-            if not_blind.any() and self.shot_miss_penalty_scale != 0.0:
-                # Angular error
-                yaw_err = self._angle_diff(self.sim.ideal_yaw, self.sim.camera_theta)
-                pitch_err = self.sim.ideal_pitch - self.sim.camera_pitch
-                angle_err = torch.sqrt(yaw_err * yaw_err + pitch_err * pitch_err)
-                angle_err = torch.clamp(angle_err, 0.0, self.shot_miss_max_angle_deg)
-                
-                # Approximate miss distance
-                # Get distance to target panel
-                target_idx = self.sim._get_target_panel_idx()
-                batch_idx = torch.arange(N, device=device)
-                target_x = self.sim.panel_x[batch_idx, target_idx]
-                target_y = self.sim.panel_y[batch_idx, target_idx]
-                target_z = self.sim.panel_z[batch_idx, target_idx]
-                
-                dx = target_x - self.sim.camera_x
-                dy = target_y - self.sim.camera_y
-                dz = target_z - self.sim.camera_z
-                distance_mm = torch.sqrt(dx*dx + dy*dy + dz*dz)
-                
-                miss_mm = distance_mm * torch.tan(angle_err)
-                ratio = miss_mm / max(self.shot_miss_target_radius_mm, 1e-6)
-                ratio = torch.clamp(ratio, 0.0, self.shot_miss_max_ratio)
-                
-                miss_penalty = -self.shot_miss_penalty_scale * (ratio ** self.shot_miss_penalty_power)
-                r_shot_miss = torch.where(not_blind, miss_penalty * shots_inc, r_shot_miss)
-        
-        # === Alignment Reward ===
+        miss_shots = torch.clamp(shots_inc - hit_inc, min=0.0)
+        if self.miss_penalty != 0.0:
+            r_shot_miss = -float(self.miss_penalty) * miss_shots
+
+        # === Predicted Yaw Reward (yaw only) ===
         yaw_err = self._angle_diff(self.sim.ideal_yaw, self.sim.camera_theta)
-        pitch_err = self.sim.ideal_pitch - self.sim.camera_pitch
-        angle_err = torch.abs(yaw_err) + torch.abs(pitch_err)
-        
-        align_score = torch.clamp(1.0 - angle_err / self.align_angle_scale_rad, min=0.0)
-        r_align = (
-            self.align_bonus_scale * align_score
-            - self.align_penalty_coeff * (angle_err ** self.align_penalty_power)
-        )
-        
-        # === Tracking Reward ===
-        # Check if target panel is visible
-        target_idx = self.sim._get_target_panel_idx()
-        batch_idx = torch.arange(N, device=device)
-        target_visible = self.sim.panel_visible[batch_idx, target_idx]
-        
-        # Update lost steps
-        self.lost_steps = torch.where(
-            target_visible,
-            torch.zeros_like(self.lost_steps),
-            self.lost_steps + 1
-        )
-        
-        # Tracking reward
-        r_track = torch.where(
-            target_visible,
-            torch.full((N,), self.track_visible_reward, device=device, dtype=dtype),
-            # Penalty when lost
-            self.lost_penalty_base + self.lost_penalty_slope * torch.clamp(
-                self.lost_steps.to(dtype), 
-                max=float(self.lost_penalty_cap_steps)
-            )
-        )
-        
-        # Terminal penalty for being lost too long
-        lost_terminal = self.lost_steps >= self.lost_done_steps
-        r_track = torch.where(
-            lost_terminal,
-            r_track + self.lost_terminal_penalty,
-            r_track
-        )
-        
-                # === Motion Penalty ===
-        r_motion = -self.motion_penalty_coeff * (torch.abs(d_theta) + torch.abs(d_pitch))
-        
-        # === Jerk Penalty ===
-        jerk_theta = torch.abs(d_theta - self.prev_d_theta)
-        jerk_pitch = torch.abs(d_pitch - self.prev_d_pitch)
-        r_jerk = -self.jerk_penalty_coeff * (jerk_theta + jerk_pitch)
-        
+        angle_err = torch.abs(yaw_err)
+        # Reward only: linear from 0 at tolerance to +scale at perfect aim.
+        in_ratio = (self.predicted_yaw_tolerance_rad - angle_err) / self.predicted_yaw_tolerance_rad
+        in_ratio = torch.clamp(in_ratio, min=0.0, max=1.0)
+        r_predicted_yaw = self.predicted_yaw_slope * in_ratio
+
+        # === Blind Fire Penalty (shots when no panels visible) ===
+        r_blind_fire = torch.zeros(N, device=device, dtype=dtype)
+        if self.blind_fire_penalty != 0.0:
+            no_visible = (self.sim.last_shot_visible_count <= 0).to(dtype)
+            r_blind_fire = self.blind_fire_penalty * shots_inc * no_visible
+
+        # === Jerk Penalty (yaw only) ===
+        r_jerk = torch.zeros(N, device=device, dtype=dtype)
+        if self.jerk_penalty_coeff != 0.0:
+            yaw_jerk = torch.abs(d_theta - self.prev_d_theta)
+            r_jerk = -self.jerk_penalty_coeff * yaw_jerk
+
         # === Total Reward ===
-        total_reward = (
-            r_hit +
-            r_shot_base +
-            r_shot_miss +
-            r_blind_fire +
-            r_align +
-            r_track +
-            r_motion +
-            r_jerk
-        )
-        
+        total_reward = r_hit + r_shot_miss + r_predicted_yaw + r_blind_fire + r_jerk
         return total_reward
 
     def _compute_dones(
@@ -492,7 +455,6 @@ class VectorizedTurretEnv:
         """
         if dones.any():
             self.reset(env_mask=dones)
-        
         return self._get_obs()
 
     def get_episode_stats(self) -> Dict[str, torch.Tensor]:
