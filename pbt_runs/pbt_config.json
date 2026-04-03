@@ -1,0 +1,14 @@
+{
+  "population": 3,
+  "generations": 3,
+  "timesteps": 500000,
+  "save_root": "pbt_runs",
+  "seed": 0,
+  "n_envs": 128,
+  "n_steps": 128,
+  "batch_size": 128,
+  "n_epochs": 2,
+  "target_kl": 0.02,
+  "hidden_dim": 16,
+  "num_layers": 16
+}

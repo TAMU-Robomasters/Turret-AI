@@ -933,6 +933,7 @@ def train(
     # Checkpointing
     save_interval: int = 50,
     save_dir: str = "checkpoints",
+    resume: Optional[str] = None,
     # Misc
     seed: Optional[int] = None,
     use_amp: bool = True,
@@ -1623,6 +1624,7 @@ def main():
         # Checkpointing
         save_interval=args.save_interval,
         save_dir=args.save_dir,
+        resume=args.resume,
         # Misc
         seed=args.seed,
         use_amp=not args.no_amp,
