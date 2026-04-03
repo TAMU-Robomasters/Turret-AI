@@ -13,6 +13,7 @@ import math
 import os
 import random
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -108,6 +109,34 @@ def _run_member(
     return score
 
 
+def _launch_member(
+    member_id: int,
+    cfg: PBTConfig,
+    base_args: List[str],
+    save_root: str,
+    timesteps: int,
+    generation: int,
+) -> Tuple[subprocess.Popen, str]:
+    save_dir = os.path.join(save_root, f"gen_{generation:02d}", f"member_{member_id:02d}")
+    os.makedirs(save_dir, exist_ok=True)
+    cmd = [
+        "python", "train_cuda.py",
+        "--save-dir", save_dir,
+        "--total-timesteps", str(timesteps),
+        "--lr", str(cfg.lr),
+        "--clip-coef", str(cfg.clip_coef),
+        "--std-init", str(cfg.std_init),
+        "--predicted-yaw-slope", str(cfg.predicted_yaw_slope),
+        "--predicted-yaw-tolerance", str(cfg.predicted_yaw_tolerance),
+        "--miss-penalty", str(cfg.miss_penalty),
+        "--hit-reward", str(cfg.hit_reward),
+    ] + base_args
+    print(f"\n=== PBT member {member_id} (gen {generation}) ===")
+    print(" ".join(cmd))
+    proc = subprocess.Popen(cmd)
+    return proc, save_dir
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--population", type=int, default=6)
@@ -115,6 +144,8 @@ def main():
     parser.add_argument("--timesteps", type=int, default=500_000)
     parser.add_argument("--save-root", type=str, default="pbt_runs")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max-parallel", type=int, default=2,
+                        help="Max members to run concurrently")
 
     # Common train_cuda args
     parser.add_argument("--n-envs", type=int, default=128)
@@ -148,9 +179,30 @@ def main():
     # Generational loop (from scratch each gen)
     for gen in range(1, args.generations + 1):
         scores: List[Tuple[int, float]] = []
-        for i, cfg in enumerate(pop):
-            score = _run_member(i, cfg, base_args, args.save_root, args.timesteps, gen)
-            scores.append((i, score))
+        running: List[Tuple[int, subprocess.Popen, str]] = []
+        next_idx = 0
+        # Launch with limited concurrency
+        while next_idx < len(pop) or running:
+            while next_idx < len(pop) and len(running) < int(args.max_parallel):
+                proc, save_dir = _launch_member(
+                    next_idx, pop[next_idx], base_args, args.save_root, args.timesteps, gen
+                )
+                running.append((next_idx, proc, save_dir))
+                next_idx += 1
+            # Poll running processes
+            still_running: List[Tuple[int, subprocess.Popen, str]] = []
+            for idx, proc, save_dir in running:
+                ret = proc.poll()
+                if ret is None:
+                    still_running.append((idx, proc, save_dir))
+                else:
+                    log_path = os.path.join(save_dir, "training.log")
+                    score = _parse_last_eval_reward(log_path)
+                    print(f"Member {idx} last eval reward: {score:.2f}")
+                    scores.append((idx, score))
+            running = still_running
+            if running:
+                time.sleep(0.5)
 
         scores.sort(key=lambda x: x[1], reverse=True)
         print(f"\nBest member in gen {gen}: {scores[0][0]} reward={scores[0][1]:.2f}")
